@@ -1,6 +1,53 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ChatEngine, ChatError } from '../src/chat.js';
+import type { ChatFetchOptions, ChatMessage } from '../src/chat.js';
+import type { ClaudeConfig } from '../src/config.js';
+
+interface RequestBody {
+  model: string;
+  system: string;
+  messages: ChatMessage[];
+  tools?: unknown;
+  tool_choice?: unknown;
+  max_tokens?: unknown;
+  cache_control?: unknown;
+}
+
+interface FetchCall {
+  url: string;
+  options: ChatFetchOptions;
+  body: RequestBody;
+}
+
+interface HarnessOptions {
+  count?: (body: RequestBody, calls: FetchCall[]) => unknown | Promise<unknown>;
+  generate?: (body: RequestBody, calls: FetchCall[]) => unknown | Promise<unknown>;
+  config?: Partial<ClaudeConfig>;
+}
+
+function parseRequest(body: string): RequestBody {
+  const value: unknown = JSON.parse(body);
+  assert.ok(value !== null && typeof value === 'object');
+  assert.ok('model' in value && typeof value.model === 'string');
+  assert.ok('system' in value && typeof value.system === 'string');
+  assert.ok('messages' in value && Array.isArray(value.messages));
+  const messages: ChatMessage[] = value.messages.map((message: unknown) => {
+    assert.ok(message !== null && typeof message === 'object');
+    assert.ok('role' in message && (message.role === 'user' || message.role === 'assistant'));
+    assert.ok('content' in message && typeof message.content === 'string');
+    return { role: message.role, content: message.content };
+  });
+  return {
+    model: value.model,
+    system: value.system,
+    messages,
+    ...('tools' in value ? { tools: value.tools } : {}),
+    ...('tool_choice' in value ? { tool_choice: value.tool_choice } : {}),
+    ...('max_tokens' in value ? { max_tokens: value.max_tokens } : {}),
+    ...('cache_control' in value ? { cache_control: value.cache_control } : {}),
+  };
+}
 
 const claude = {
   apiKey: 'test-secret-key',
@@ -10,13 +57,13 @@ const claude = {
   timeoutMs: 1_000,
 };
 
-function harness({ count = () => 20, generate, config = {} } = {}) {
-  const calls = [];
+function harness({ count = () => 20, generate, config = {} }: HarnessOptions = {}) {
+  const calls: FetchCall[] = [];
   const engine = new ChatEngine({
     claude: { ...claude, ...config },
     system: 'Always be a helpful cat.',
     fetchImpl: async (url, options) => {
-      const body = JSON.parse(options.body);
+      const body = parseRequest(options.body);
       const call = { url, options, body };
       calls.push(call);
       if (url.endsWith('/count_tokens')) {
@@ -24,7 +71,7 @@ function harness({ count = () => 20, generate, config = {} } = {}) {
         return result instanceof Response ? result : Response.json({ input_tokens: result });
       }
       const result = generate ? await generate(body, calls) : {
-        content: [{ type: 'text', text: `answer:${body.messages.at(-1).content}` }],
+        content: [{ type: 'text', text: `answer:${body.messages.at(-1)?.content}` }],
         stop_reason: 'end_turn',
       };
       return result instanceof Response ? result : Response.json(result);
@@ -37,8 +84,8 @@ function harness({ count = () => 20, generate, config = {} } = {}) {
   };
 }
 
-function hasCode(code, status) {
-  return (error) => {
+function hasCode(code: string, status?: number) {
+  return (error: unknown) => {
     assert.ok(error instanceof ChatError);
     assert.equal(error.code, code);
     assert.equal(error.message, code);
@@ -95,7 +142,7 @@ test('oversized system plus current input never generates or truncates', async (
 
 test('oversized current input still fails after every old pair is removed', async () => {
   const { engine, generations } = harness({
-    count: (body) => body.messages.at(-1).content === 'oversized' ? 91 : 20,
+    count: (body) => body.messages.at(-1)?.content === 'oversized' ? 91 : 20,
   });
   (await engine.prepare('chat', 'old')).commit();
   await assert.rejects(engine.prepare('chat', 'oversized'), hasCode('CONTEXT_TOO_LARGE'));
@@ -195,7 +242,7 @@ test('pre-aborted and in-flight cancelled requests return safe ABORTED errors', 
 });
 
 test('timeout aborts the fetch and returns a safe TIMEOUT error', async () => {
-  let fetchSignal;
+  let fetchSignal: AbortSignal | undefined;
   const engine = new ChatEngine({
     claude: { ...claude, timeoutMs: 10 },
     system: 'cat',
@@ -207,6 +254,7 @@ test('timeout aborts the fetch and returns a safe TIMEOUT error', async () => {
     },
   });
   await assert.rejects(engine.prepare('chat', 'hello'), hasCode('TIMEOUT'));
+  assert.ok(fetchSignal);
   assert.equal(fetchSignal.aborted, true);
 });
 
@@ -245,7 +293,7 @@ test('hard context ceiling cannot be configured above 100000 tokens', () => {
   }), hasCode('INVALID_CONFIG'));
 });
 
-function followupResult(shouldReply, reply) {
+function followupResult(shouldReply: boolean, reply: string) {
   return {
     stop_reason: 'tool_use',
     content: [{
@@ -257,7 +305,7 @@ function followupResult(shouldReply, reply) {
   };
 }
 
-function followupHarness(options = {}) {
+function followupHarness(options: HarnessOptions = {}) {
   return harness({
     ...options,
     generate: (body, calls) => body.tools
@@ -275,7 +323,7 @@ test('unrelated followups return null without contaminating or trimming history'
   (await engine.prepare('chat', 'second')).commit();
   assert.equal(await engine.prepare('chat', 'unrelated', undefined, { followup: true }), null);
   await engine.prepare('chat', 'direct');
-  assert.deepEqual(generations().at(-1).body.messages.map((message) => message.content), [
+  assert.deepEqual(generations().at(-1)?.body.messages.map((message) => message.content), [
     'first', '先前的回答', 'second', '先前的回答', 'direct',
   ]);
 });
@@ -284,8 +332,10 @@ test('relevant followups commit only plain reply text and remain transactional',
   const { engine, generations } = followupHarness();
   (await engine.prepare('chat', 'first')).commit();
   const uncommitted = await engine.prepare('chat', 'not sent', undefined, { followup: true });
+  assert.ok(uncommitted);
   assert.equal(uncommitted.text, '自然的回答');
   const turn = await engine.prepare('chat', 'followup', undefined, { followup: true });
+  assert.ok(turn);
   assert.deepEqual(generations()[2].body.messages.map((message) => message.content), [
     'first', '先前的回答', 'followup',
   ]);
@@ -293,7 +343,8 @@ test('relevant followups commit only plain reply text and remain transactional',
   turn.commit();
   uncommitted.commit();
   await engine.prepare('chat', 'direct');
-  const direct = generations().at(-1).body;
+  const direct = generations().at(-1)?.body;
+  assert.ok(direct);
   assert.deepEqual(direct.messages.map((message) => message.content), [
     'first', '先前的回答', 'followup', '自然的回答', 'direct',
   ]);
@@ -312,7 +363,7 @@ test('followups without retained conversational evidence stay silent without gen
   assert.equal(await engine.prepare('chat', 'followup', undefined, { followup: true }), null);
   assert.equal(generations().length, 1);
   await engine.prepare('chat', 'direct');
-  assert.equal(generations().at(-1).body.messages[0].content, 'first');
+  assert.equal(generations().at(-1)?.body.messages[0].content, 'first');
   engine.clear('chat');
   const before = calls.length;
   assert.equal(await engine.prepare('chat', 'after clear', undefined, { followup: true }), null);
@@ -326,8 +377,10 @@ test('followup counts include identical decision system, tools and choice at the
   });
   (await engine.prepare('chat', 'first')).commit();
   await engine.prepare('chat', 'followup', undefined, { followup: true });
-  const generated = generations().at(-1).body;
-  const counted = calls.findLast((call) => call.url.endsWith('/count_tokens')).body;
+  const generated = generations().at(-1)?.body;
+  const counted = calls.findLast((call) => call.url.endsWith('/count_tokens'))?.body;
+  assert.ok(generated);
+  assert.ok(counted);
   const { max_tokens, cache_control, ...input } = generated;
   assert.equal(max_tokens, 1_000);
   assert.deepEqual(counted, input);
@@ -349,7 +402,7 @@ test('oversized followup decision overhead never generates and preserves prior h
   assert.deepEqual(counts[0].body.tools, counts[1].body.tools);
   assert.deepEqual(counts[0].body.tool_choice, counts[1].body.tool_choice);
   await engine.prepare('chat', 'direct');
-  assert.equal(generations().at(-1).body.messages[0].content, 'first');
+  assert.equal(generations().at(-1)?.body.messages[0].content, 'first');
 });
 
 test('malformed followup decisions fail closed and never enter history', async () => {
@@ -382,7 +435,7 @@ test('malformed followup decisions fail closed and never enter history', async (
       hasCode('INVALID_RESPONSE'),
     );
     await engine.prepare('chat', 'direct');
-    assert.deepEqual(generations().at(-1).body.messages.map((message) => message.content), [
+    assert.deepEqual(generations().at(-1)?.body.messages.map((message) => message.content), [
       'first', '先前的回答', 'direct',
     ]);
   }
@@ -421,7 +474,7 @@ test('followup cancellation before and during generation never commits a decisio
     hasCode('ABORTED'),
   );
   await engine.prepare('chat', 'direct');
-  assert.deepEqual(generations().at(-1).body.messages.map((message) => message.content), [
+  assert.deepEqual(generations().at(-1)?.body.messages.map((message) => message.content), [
     'first', '先前的回答', 'direct',
   ]);
 });
@@ -431,10 +484,11 @@ test('aborting after a followup prepare invalidates its commit', async () => {
   (await engine.prepare('chat', 'first')).commit();
   const controller = new AbortController();
   const turn = await engine.prepare('chat', 'followup', controller.signal, { followup: true });
+  assert.ok(turn);
   controller.abort();
   turn.commit();
   await engine.prepare('chat', 'direct');
-  assert.deepEqual(generations().at(-1).body.messages.map((message) => message.content), [
+  assert.deepEqual(generations().at(-1)?.body.messages.map((message) => message.content), [
     'first', '先前的回答', 'direct',
   ]);
 });

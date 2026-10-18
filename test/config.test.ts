@@ -1,11 +1,11 @@
-import test from 'node:test';
+import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, writeFile, rm, chmod, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadConfig } from '../src/config.js';
 
-async function fixture(t) {
+async function fixture(t: TestContext) {
   const directory = await mkdtemp(join(tmpdir(), 'nekochat-config-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const filename = join(directory, 'config.json');
@@ -32,7 +32,7 @@ test('refuses empty authorization scope and token without exposing credentials',
   const { filename, config, save } = await fixture(t);
   config.line.chats = [];
   await save();
-  await assert.rejects(loadConfig(filename), error => /line.chats/.test(error.message) && !error.message.includes(config.claude.apiKey));
+  await assert.rejects(loadConfig(filename), (error: unknown) => error instanceof Error && /line.chats/.test(error.message) && !error.message.includes(config.claude.apiKey));
   config.line.token = '';
   await save();
   await assert.rejects(loadConfig(filename), /line.token/);

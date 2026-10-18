@@ -9,12 +9,19 @@
     "node": ">=22"
   },
   "scripts": {
-    "start": "node src/main.js",
-    "check": "node src/main.js --check",
-    "test": "node --test"
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "npm run build && node dist/src/main.js",
+    "check": "npm run build && node dist/src/main.js --check",
+    "test": "npm run build && node --test dist/test/*.test.js"
   },
   "dependencies": {
     "ws": "8.22.0",
     "yaml": "2.9.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "@types/ws": "^8.18.2",
+    "typescript": "^7.0.2"
   }
 }

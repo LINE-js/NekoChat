@@ -4,10 +4,10 @@
 
 ## 啟動
 
-需要 Node.js ≥ 22、已登入的 LINE.js，以及可使用指定模型的 Anthropic API key。
+需要 Node.js ≥ 22、npm、已登入的 LINE.js，以及可使用指定模型的 Anthropic API key。應用程式與測試皆使用 strict TypeScript，編譯後由 Node.js 執行。`start.sh` 會自動安裝缺少的依賴；若要手動安裝：
 
 ```sh
-npm install
+npm ci --include=dev --ignore-scripts
 ```
 
 本機已有 `config.yaml` 時直接編輯，不要覆蓋。全新安裝且尚無設定檔時，從 `config.example.yaml` 複製為 `config.yaml` 並將檔案權限設為 `600`。啟動與檢查預設皆讀取 `config.yaml`。
@@ -22,7 +22,7 @@ npm install
 ./start.sh
 ```
 
-`start.sh` 可從任意工作目錄執行，會先檢查 Node.js ≥ 22 與依賴；依賴無法載入時自動執行 `npm ci --ignore-scripts`，依照 lockfile 重建 `node_modules`，不執行套件安裝腳本，也不會覆蓋設定。需要 npm；安裝失敗或安裝後仍無法載入依賴時停止啟動。`--check` 只驗證本機設定，不連線 LINE 或 Anthropic，但缺少依賴時仍會觸發安裝，可能連線 npm registry。指定其他設定檔可使用 `./start.sh --config /path/to/config.yaml`，相對設定路徑以專案目錄為基準；按 Ctrl+C 停止。修改設定後須重啟。原有 `npm start`、`npm run check` 仍可使用，但不會自動安裝依賴。
+`start.sh` 可從任意工作目錄執行，會先檢查 Node.js ≥ 22、執行依賴及 TypeScript 工具鏈；缺少或無法載入時自動執行 `npm ci --include=dev --ignore-scripts`，依照 lockfile 重建 `node_modules`，不執行套件安裝腳本，也不會覆蓋設定。即使 `NODE_ENV=production` 也會安裝編譯所需的開發依賴。每次啟動先編譯至 `dist/`；安裝、依賴載入或編譯失敗時停止，不啟動舊產物。`--check` 只驗證本機設定，不連線 LINE 或 Anthropic，但缺少依賴時仍會觸發安裝，可能連線 npm registry。指定其他設定檔可使用 `./start.sh --config /path/to/config.yaml`，相對設定路徑以專案目錄為基準；按 Ctrl+C 停止。修改設定後須重啟。`npm start`、`npm run check` 也會先編譯，但不會自動安裝依賴。
 
 `line.chats` 不得留空；只有同時在 LINE.js 與 NekoChat 白名單內的聊天室會被處理。初次只在引用回覆語喵、LINE @ 標記語喵，或文字包含「語喵」時接話。接話後由 Claude 判斷後續訊息是否延續與語喵的對話，無關或不確定時保持安靜。請確認群組成員同意將訊息送往 Anthropic；建議先用測試群與次要 LINE 帳號驗證。
 
@@ -67,10 +67,14 @@ npm install
 `config.yaml` 已被 `.gitignore` 排除，包含金鑰時必須維持權限 `600`；載入器拒絕符號連結與群組／其他使用者可讀的設定檔。範本不含金鑰。已在對話中貼出的金鑰建議撤銷後更換，切勿提交到 Git。
 
 ```sh
+npm run typecheck
+npm run build
 npm test
 ```
 
-測試使用本機 WebSocket 與隔離的 Claude 回應，不消耗 API 額度，涵蓋上下文邊界、群聊隔離、自我回覆排除、取消、分段、發送確認及 10 秒重連。
+`npm run typecheck` 僅檢查型別，`npm run build` 將 `src/` 與 `test/` 的 TypeScript 編譯至已忽略的 `dist/`；`npm test` 會先編譯，再以 Node.js test runner 執行測試。測試使用本機 WebSocket 與隔離的 Claude 回應，不消耗 API 額度，涵蓋上下文邊界、群聊隔離、自我回覆排除、取消、分段、發送確認及 10 秒重連。
 
 開發驗證另曾以真實 `claude-haiku-5-5` 配合本機 `/api/ws` 測試伺服器執行實際 CLI，確認群聊辨識、完整收發及斷線重連。尚未以真實 LINE.js Bot Token／聊天室驗證 LINE 端收發。
 選擇性回覆另以真實 Claude 與本機 `/api/ws` 執行驗證：未呼叫語喵時不生成、名字／標記／引用三種觸發可用、相關追問會回答、無關閒聊與其他成員之間的同主題對話保持安靜。
+
+TypeScript 遷移另以全新隔離副本驗證 `start.sh` 自動安裝（含 `NODE_ENV=production`）、編譯及設定檢查；以本機 WebSocket 與模擬 Anthropic 回應啟動實際編譯後 CLI，確認選擇性觸發、收發確認、斷線重連及 Ctrl+C 關閉。編譯失敗時拒絕啟動舊產物；此驗證未呼叫真實 LINE 或 Anthropic 服務。

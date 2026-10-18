@@ -16,8 +16,8 @@ if (!valid) {
   console.error('用法：npm start -- [--config 設定檔路徑] [--check]');
   process.exitCode = 1;
 } else {
-  let bot;
-  let shutdown;
+  let bot: ChatBot | undefined;
+  let shutdown: (() => void) | undefined;
   try {
     const { config, system } = await loadConfig(filename);
     if (check) {
@@ -25,7 +25,8 @@ if (!valid) {
     } else {
       const engine = new ChatEngine({ claude: config.claude, system });
       bot = new ChatBot({ config, engine, log: code => console.log(`[NekoChat] ${code}`) });
-      shutdown = () => bot.stop();
+      const activeBot = bot;
+      shutdown = () => activeBot.stop();
       process.once('SIGINT', shutdown);
       process.once('SIGTERM', shutdown);
       bot.start();

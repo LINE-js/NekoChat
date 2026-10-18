@@ -1,18 +1,92 @@
 import WebSocket from 'ws';
 import { randomUUID } from 'node:crypto';
+import type { LineConfig } from './config.js';
+import type { ChatEngineLike } from './chat.js';
+
+export interface LineMessage {
+  channelId: string;
+  messageId: string;
+  senderId: string;
+  text: string;
+  contentType: string;
+  channelKind?: unknown;
+  senderName?: unknown;
+  mentions?: unknown;
+  replyTo?: unknown;
+  unsent?: unknown;
+  decryptFailed?: unknown;
+}
+
+export type LineRequest =
+  | { type: 'ping' | 'pong' }
+  | { type: 'chat:admins:get'; requestId: string; chatId: string }
+  | { type: 'message:send'; requestId: string; chatId: string; text: string; replyTo: string };
+
+export interface SentEvent {
+  type: 'sent';
+  requestId: string;
+  messageId?: unknown;
+}
+
+export interface AdminsEvent {
+  type: 'chat:admins';
+  requestId: string;
+  chatId?: unknown;
+  ownMemberId?: unknown;
+}
+
+type ResponseEvent = SentEvent | AdminsEvent;
+type PendingRequest = {
+  type: ResponseEvent['type'];
+  chatId: string;
+  resolve(event: ResponseEvent): void;
+  reject(error: Error): void;
+};
+
+export type LineEvent =
+  | { type: 'ping' | 'pong' }
+  | { type: 'hello'; protocol?: unknown; capabilities?: unknown }
+  | { type: 'auth:state'; state?: unknown }
+  | { type: 'auth:ready'; profile?: unknown }
+  | { type: 'sent' | 'chat:admins' | 'error'; requestId?: unknown; messageId?: unknown; chatId?: unknown; ownMemberId?: unknown }
+  | { type: 'channels'; channels?: unknown }
+  | { type: 'message'; message?: unknown }
+  | { type: 'message:edit'; message?: unknown }
+  | { type: 'message:unsend'; chatId?: unknown; messageId?: unknown };
+
+function isLineEvent(value: unknown): value is LineEvent {
+  if (value === null || typeof value !== 'object' || !('type' in value)) return false;
+  switch (value.type) {
+    case 'ping': case 'pong': case 'hello': case 'auth:state': case 'auth:ready':
+    case 'sent': case 'chat:admins': case 'error': case 'channels':
+    case 'message': case 'message:edit': case 'message:unsend':
+      return true;
+    default:
+      return false;
+  }
+}
+
+function isMessage(value: unknown): value is LineMessage {
+  return value !== null && typeof value === 'object' &&
+    'channelId' in value && typeof value.channelId === 'string' &&
+    'messageId' in value && typeof value.messageId === 'string' &&
+    'senderId' in value && typeof value.senderId === 'string' &&
+    'text' in value && typeof value.text === 'string' &&
+    'contentType' in value && typeof value.contentType === 'string';
+}
 
 const REQUEST_TIMEOUT = 15_000;
 const HEARTBEAT_INTERVAL = 30_000;
 const HEARTBEAT_TIMEOUT = 10_000;
 const DEDUP_LIMIT = 10_000;
 
-function failure(code) {
+function failure(code: string): Error & { code: string } {
   return Object.assign(new Error(code), { code });
 }
 
-function delay(ms, signal) {
+function delay(ms: number, signal: AbortSignal): Promise<void> {
   if (signal.aborted) return Promise.reject(failure('cancelled'));
-  return new Promise((resolve, reject) => {
+  return new Promise<void>((resolve, reject) => {
     const cancel = () => {
       clearTimeout(timer);
       signal.removeEventListener('abort', cancel);
@@ -26,7 +100,7 @@ function delay(ms, signal) {
   });
 }
 
-function splitText(text, maximum) {
+function splitText(text: string, maximum: number): string[] {
   if (typeof text !== 'string' || !text.trim()) throw failure('invalid_reply');
   const chunks = [];
   let offset = 0;
@@ -50,7 +124,36 @@ function splitText(text, maximum) {
 }
 
 export class ChatBot {
-  constructor({ config, engine, log = () => {} }) {
+  config: { line: LineConfig };
+  engine: ChatEngineLike;
+  log: (code: string) => void;
+  allowed: Set<string>;
+  pending: Map<string, PendingRequest>;
+  identities: Map<string, Promise<string>>;
+  jobs: Map<string, Set<AbortController>>;
+  queues: Map<string, Promise<void>>;
+  seen: Map<string, boolean>;
+  engaged: Set<string>;
+  ownMessages: Map<string, string>;
+  rateQueue: Promise<void>;
+  lastSend: number;
+  sendTimes: number[];
+  stopped: boolean;
+  started: boolean;
+  ready: boolean;
+  protocolReady: boolean;
+  capabilities: Set<unknown>;
+  closed: Promise<void>;
+  resolveClosed: () => void;
+  socket: WebSocket | undefined;
+  heartbeat: NodeJS.Timeout | undefined;
+  heartbeatDeadline: NodeJS.Timeout | undefined;
+  reconnectTimer: NodeJS.Timeout | undefined;
+  userId: string | undefined;
+  channels: Set<string> | undefined;
+  constructor({ config, engine, log = () => {} }: {
+    config: { line: LineConfig }; engine: ChatEngineLike; log?: (code: string) => void;
+  }) {
     this.config = config;
     this.engine = engine;
     this.log = log;
@@ -70,7 +173,9 @@ export class ChatBot {
     this.ready = false;
     this.protocolReady = false;
     this.capabilities = new Set();
-    this.closed = new Promise(resolve => { this.resolveClosed = resolve; });
+    let resolveClosed: () => void = () => {};
+    this.closed = new Promise<void>(resolve => { resolveClosed = resolve; });
+    this.resolveClosed = resolveClosed;
   }
 
   start() {
@@ -115,7 +220,7 @@ export class ChatBot {
     });
   }
 
-  disconnect(code) {
+  disconnect(code: string): void {
     if (this.stopped) return;
     this.log(code);
     this.cleanupConnection();
@@ -163,23 +268,27 @@ export class ChatBot {
     this.engine.clearAll();
   }
 
-  cancelChat(chatId) {
+  cancelChat(chatId: string): void {
     for (const job of this.jobs.get(chatId) ?? []) job.abort();
     this.engine.clear(chatId);
     this.engaged.delete(chatId);
     this.identities.delete(chatId);
   }
 
-  rememberOwn(chatId, messageId) {
+  rememberOwn(chatId: string, messageId: unknown): void {
     if (typeof messageId !== 'string' || !messageId) return;
     this.ownMessages.set(JSON.stringify([chatId, messageId]), chatId);
-    if (this.ownMessages.size > DEDUP_LIMIT) this.ownMessages.delete(this.ownMessages.keys().next().value);
+    const oldest = this.ownMessages.keys().next();
+    if (this.ownMessages.size > DEDUP_LIMIT && !oldest.done) this.ownMessages.delete(oldest.value);
   }
 
-  isDirect(message, ownId) {
+  isDirect(message: LineMessage, ownId: string): boolean {
     if (message.text.includes('語喵')) return true;
-    if (Array.isArray(message.mentions) && message.mentions.some(mention =>
-      mention?.userId === ownId &&
+    if (Array.isArray(message.mentions) && message.mentions.some((mention: unknown) =>
+      mention !== null && typeof mention === 'object' &&
+      'userId' in mention && mention.userId === ownId &&
+      'start' in mention && 'end' in mention &&
+      typeof mention.start === 'number' && typeof mention.end === 'number' &&
       Number.isInteger(mention.start) && Number.isInteger(mention.end) &&
       mention.start >= 0 && mention.end > mention.start && mention.end <= message.text.length &&
       message.text[mention.start] === '@'
@@ -200,8 +309,8 @@ export class ChatBot {
     }
   }
 
-  receive(event) {
-    if (!event || typeof event !== 'object') return;
+  receive(event: unknown): void {
+    if (!isLineEvent(event)) return;
     if (event.type === 'pong') {
       clearTimeout(this.heartbeatDeadline);
       this.heartbeatDeadline = undefined;
@@ -228,7 +337,8 @@ export class ChatBot {
       return;
     }
     if (event.type === 'auth:ready') {
-      if (!this.protocolReady || typeof event.profile?.userId !== 'string' || !event.profile.userId) return;
+      if (!this.protocolReady || !event.profile || typeof event.profile !== 'object' ||
+          !('userId' in event.profile) || typeof event.profile.userId !== 'string' || !event.profile.userId) return;
       if (this.userId && this.userId !== event.profile.userId) this.invalidateAll();
       this.userId = event.profile.userId;
       this.ready = true;
@@ -236,17 +346,20 @@ export class ChatBot {
       return;
     }
     if (event.type === 'sent' || event.type === 'chat:admins' || event.type === 'error') {
+      if (typeof event.requestId !== 'string') return;
       const pending = this.pending.get(event.requestId);
       if (!pending) return;
       if (event.type === 'error') pending.reject(failure('line_request_failed'));
       else if (event.type === pending.type) {
         if (event.type === 'sent') this.rememberOwn(pending.chatId, event.messageId);
-        pending.resolve(event);
+        pending.resolve(event as ResponseEvent);
       }
       return;
     }
     if (event.type === 'channels' && Array.isArray(event.channels)) {
-      const next = new Set(event.channels.map(channel => channel.channelId));
+      const next = new Set(event.channels.flatMap((channel: unknown) =>
+        channel !== null && typeof channel === 'object' && 'channelId' in channel &&
+        typeof channel.channelId === 'string' ? [channel.channelId] : []));
       for (const chatId of new Set([...(this.channels ?? []), ...this.jobs.keys(), ...this.engaged, ...this.ownMessages.values()])) {
         if (!next.has(chatId)) {
           this.cancelChat(chatId);
@@ -260,9 +373,15 @@ export class ChatBot {
     }
     if (!this.ready) return;
     if (event.type === 'message:edit' || event.type === 'message:unsend') {
-      const chatId = event.type === 'message:edit' ? event.message?.channelId : event.chatId;
-      if (this.allowed.has(chatId)) {
-        const messageId = event.type === 'message:edit' ? event.message?.messageId : event.messageId;
+      const changedMessage = event.type === 'message:edit' && event.message !== null &&
+        typeof event.message === 'object' ? event.message : undefined;
+      const chatId = event.type === 'message:edit'
+        ? changedMessage && 'channelId' in changedMessage ? changedMessage.channelId : undefined
+        : event.chatId;
+      if (typeof chatId === 'string' && this.allowed.has(chatId)) {
+        const messageId = event.type === 'message:edit'
+          ? changedMessage && 'messageId' in changedMessage ? changedMessage.messageId : undefined
+          : event.messageId;
         if (event.type === 'message:unsend') this.ownMessages.delete(JSON.stringify([chatId, messageId]));
         this.cancelChat(chatId);
       }
@@ -270,25 +389,27 @@ export class ChatBot {
     }
     if (event.type !== 'message') return;
     const message = event.message;
-    if (!message || !this.allowed.has(message.channelId) || (this.channels && !this.channels.has(message.channelId))) return;
+    if (!isMessage(message) || !this.allowed.has(message.channelId) || (this.channels && !this.channels.has(message.channelId))) return;
     if (message.contentType !== 'TEXT' || typeof message.text !== 'string' || !message.text.trim() || message.unsent || message.decryptFailed) return;
     if (typeof message.messageId !== 'string' || !message.messageId || typeof message.senderId !== 'string' || !message.senderId) return;
     const key = JSON.stringify([message.channelId, message.messageId]);
     if (this.seen.has(key)) return;
     this.seen.set(key, true);
-    if (this.seen.size > DEDUP_LIMIT) this.seen.delete(this.seen.keys().next().value);
+    const oldest = this.seen.keys().next();
+    if (this.seen.size > DEDUP_LIMIT && !oldest.done) this.seen.delete(oldest.value);
     this.enqueue(message);
   }
 
-  enqueue(message) {
+  enqueue(message: LineMessage): void {
     const chatId = message.channelId;
     const controller = new AbortController();
     let jobs = this.jobs.get(chatId);
     if (!jobs) this.jobs.set(chatId, jobs = new Set());
     jobs.add(controller);
     const previous = this.queues.get(chatId) ?? Promise.resolve();
-    const work = previous.then(() => this.reply(message, controller.signal)).catch(error => {
-      if (!controller.signal.aborted) this.log(error?.code === 'identity_unavailable' ? 'identity_unavailable' : 'reply_failed');
+    const work = previous.then(() => this.reply(message, controller.signal)).catch((error: unknown) => {
+      if (!controller.signal.aborted) this.log(error !== null && typeof error === 'object' &&
+        'code' in error && error.code === 'identity_unavailable' ? 'identity_unavailable' : 'reply_failed');
     }).finally(() => {
       jobs.delete(controller);
       if (!jobs.size && this.jobs.get(chatId) === jobs) this.jobs.delete(chatId);
@@ -297,7 +418,7 @@ export class ChatBot {
     this.queues.set(chatId, work);
   }
 
-  async ownId(message, signal) {
+  async ownId(message: LineMessage, signal: AbortSignal): Promise<string | undefined> {
     if (message.channelKind !== 'square') return this.userId;
     const configured = this.config.line.ownMemberIds?.[message.channelId];
     if (configured) return configured;
@@ -305,7 +426,7 @@ export class ChatBot {
     let identity = this.identities.get(message.channelId);
     if (!identity) {
       identity = this.request('chat:admins:get', { chatId: message.channelId }, 'chat:admins', signal).then(event => {
-        if (event.chatId !== message.channelId || typeof event.ownMemberId !== 'string' || !event.ownMemberId) throw failure('identity_unavailable');
+        if (event.type !== 'chat:admins' || event.chatId !== message.channelId || typeof event.ownMemberId !== 'string' || !event.ownMemberId) throw failure('identity_unavailable');
         return event.ownMemberId;
       });
       this.identities.set(message.channelId, identity);
@@ -316,7 +437,7 @@ export class ChatBot {
     return identity;
   }
 
-  async reply(message, signal) {
+  async reply(message: LineMessage, signal: AbortSignal): Promise<void> {
     if (signal.aborted || !this.ready) return;
     const ownId = await this.ownId(message, signal);
     if (!ownId || signal.aborted) return;
@@ -345,7 +466,7 @@ export class ChatBot {
     }
   }
 
-  rateLimit(signal) {
+  rateLimit(signal: AbortSignal): Promise<void> {
     const slot = this.rateQueue.then(async () => {
       if (signal.aborted) throw failure('cancelled');
       // Permit short bursts without exceeding the server's rolling minute budget.
@@ -369,16 +490,20 @@ export class ChatBot {
     return slot;
   }
 
-  send(event) {
+  send(event: LineRequest): void {
     if (this.stopped || this.socket?.readyState !== WebSocket.OPEN) throw failure('disconnected');
     this.socket.send(JSON.stringify(event));
   }
 
-  request(type, payload, expectedType, signal) {
+  request(
+    ...[type, payload, expectedType, signal]:
+      | [type: 'chat:admins:get', payload: { chatId: string }, expectedType: 'chat:admins', signal: AbortSignal]
+      | [type: 'message:send', payload: { chatId: string; text: string; replyTo: string }, expectedType: 'sent', signal: AbortSignal]
+  ): Promise<ResponseEvent> {
     if (signal.aborted) return Promise.reject(failure('cancelled'));
     const requestId = randomUUID();
-    return new Promise((resolve, reject) => {
-      const finish = (callback, value) => {
+    return new Promise<ResponseEvent>((resolve, reject) => {
+      const finish = <T>(callback: (value: T) => void, value: T): void => {
         clearTimeout(timer);
         signal.removeEventListener('abort', cancel);
         this.pending.delete(requestId);
@@ -394,7 +519,8 @@ export class ChatBot {
       });
       signal.addEventListener('abort', cancel, { once: true });
       try {
-        this.send({ type, requestId, ...payload });
+        if (type === 'message:send') this.send({ type, requestId, ...payload });
+        else this.send({ type, requestId, ...payload });
       } catch {
         finish(reject, failure('disconnected'));
       }

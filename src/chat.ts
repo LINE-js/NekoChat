@@ -1,3 +1,57 @@
+import type { ClaudeConfig } from './config.js';
+import { isRecord } from './guards.js';
+
+export interface PreparedTurn {
+  text: string;
+  commit(): void;
+}
+
+export interface PrepareOptions {
+  followup?: boolean;
+}
+
+export interface ChatEngineLike {
+  prepare(chatId: string, input: string, signal?: AbortSignal, options?: PrepareOptions): Promise<PreparedTurn | null>;
+  clear(chatId: string): void;
+  clearAll(): void;
+}
+
+export interface ChatFetchResponse {
+  ok: boolean;
+  status: number;
+  json(): Promise<unknown>;
+}
+
+export interface ChatFetchOptions {
+  method: 'POST';
+  headers: Record<string, string>;
+  body: string;
+  signal: AbortSignal;
+}
+
+export type ChatFetch = (url: string, options: ChatFetchOptions) => Promise<ChatFetchResponse>;
+
+export interface ChatEngineOptions {
+  claude: ClaudeConfig;
+  system: string;
+  fetchImpl?: ChatFetch;
+}
+
+export interface ChatMessage {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+interface ChatState {
+  messages: ChatMessage[];
+  revision: number;
+}
+
+
+function isTextBlock(value: unknown): value is { type: 'text'; text: string } {
+  return isRecord(value) && value.type === 'text' && typeof value.text === 'string';
+}
+
 const API_ROOT = 'https://api.anthropic.com/v1';
 const MAX_CONTEXT_TOKENS = 100_000;
 
@@ -29,7 +83,10 @@ decision; call it exactly once. When shouldReply=true, reply must contain only t
 chat answer in your usual personality, never this decision format or its control fields.`;
 
 export class ChatError extends Error {
-  constructor(code, status) {
+  readonly code: string;
+  readonly status?: number;
+
+  constructor(code: string, status?: number) {
     super(code);
     this.name = 'ChatError';
     this.code = code;
@@ -37,13 +94,13 @@ export class ChatError extends Error {
   }
 }
 
-export class ChatEngine {
-  #claude;
-  #system;
-  #fetch;
-  #chats = new Map();
+export class ChatEngine implements ChatEngineLike {
+  #claude: ClaudeConfig;
+  #system: string;
+  #fetch: ChatFetch;
+  #chats = new Map<string, ChatState>();
 
-  constructor({ claude, system, fetchImpl = globalThis.fetch }) {
+  constructor({ claude, system, fetchImpl = globalThis.fetch }: ChatEngineOptions) {
     if (
       !claude || typeof claude.apiKey !== 'string' || !claude.apiKey.trim() ||
       typeof claude.model !== 'string' || !claude.model.trim() ||
@@ -61,15 +118,17 @@ export class ChatEngine {
     this.#fetch = fetchImpl;
   }
 
-  clear(chatId) {
+  clear(chatId: string): void {
     this.#chats.delete(chatId);
   }
 
-  clearAll() {
+  clearAll(): void {
     this.#chats.clear();
   }
 
-  async prepare(chatId, input, signal, { followup = false } = {}) {
+  prepare(chatId: string, input: string, signal?: AbortSignal, options?: { followup?: false }): Promise<PreparedTurn>;
+  prepare(chatId: string, input: string, signal: AbortSignal | undefined, options: PrepareOptions): Promise<PreparedTurn | null>;
+  async prepare(chatId: string, input: string, signal?: AbortSignal, { followup = false }: PrepareOptions = {}): Promise<PreparedTurn | null> {
     if (typeof chatId !== 'string' || !chatId || typeof input !== 'string' || !input.trim()) {
       throw new ChatError('INVALID_INPUT');
     }
@@ -95,9 +154,9 @@ export class ChatEngine {
       if (signal?.aborted) throw new ChatError('ABORTED');
       if (timedOut) throw new ChatError('TIMEOUT');
     };
-    const request = async (endpoint, body, failureCode) => {
+    const request = async (endpoint: string, body: unknown, failureCode: string): Promise<unknown> => {
       checkAbort();
-      let response;
+      let response: ChatFetchResponse | undefined;
       try {
         response = await this.#fetch(`${API_ROOT}/${endpoint}`, {
           method: 'POST',
@@ -111,7 +170,7 @@ export class ChatEngine {
         });
         checkAbort();
         if (!response.ok) throw new ChatError(failureCode, response.status);
-        const result = await response.json();
+        const result: unknown = await response.json();
         checkAbort();
         return result;
       } catch (error) {
@@ -122,7 +181,7 @@ export class ChatEngine {
     };
 
     try {
-      const user = { role: 'user', content: input };
+      const user: ChatMessage = { role: 'user', content: input };
       const history = state.messages;
       const pairCount = history.length / 2;
       const requestOptions = {
@@ -130,13 +189,13 @@ export class ChatEngine {
         system: followup ? `${this.#system}\n${FOLLOWUP_SYSTEM}` : this.#system,
         ...(followup ? { tools: [FOLLOWUP_TOOL], tool_choice: FOLLOWUP_CHOICE } : {}),
       };
-      const messagesAfter = (droppedPairs) => [...history.slice(droppedPairs * 2), user];
-      const count = async (messages) => {
+      const messagesAfter = (droppedPairs: number): ChatMessage[] => [...history.slice(droppedPairs * 2), user];
+      const count = async (messages: ChatMessage[]): Promise<boolean> => {
         const result = await request('messages/count_tokens', {
           ...requestOptions,
           messages,
         }, 'COUNT_FAILED');
-        if (!Number.isSafeInteger(result?.input_tokens) || result.input_tokens < 0) {
+        if (!isRecord(result) || typeof result.input_tokens !== 'number' || !Number.isSafeInteger(result.input_tokens) || result.input_tokens < 0) {
           throw new ChatError('COUNT_FAILED');
         }
         return result.input_tokens + this.#claude.maxOutputTokens <= this.#claude.contextTokens;
@@ -172,17 +231,18 @@ export class ChatEngine {
         max_tokens: this.#claude.maxOutputTokens,
         cache_control: { type: 'ephemeral' },
       }, 'GENERATION_FAILED');
-      if (result?.stop_reason === 'max_tokens') throw new ChatError('OUTPUT_TRUNCATED');
-      let text;
+      if (isRecord(result) && result.stop_reason === 'max_tokens') throw new ChatError('OUTPUT_TRUNCATED');
+      let text: string;
       if (followup) {
-        const block = result?.content?.[0];
-        const decision = block?.input;
+        const content: unknown = isRecord(result) ? result.content : undefined;
+        const block: unknown = Array.isArray(content) ? content[0] : undefined;
+        const decision: unknown = isRecord(block) ? block.input : undefined;
         if (
-          result?.stop_reason !== 'tool_use' ||
-          !Array.isArray(result?.content) || result.content.length !== 1 ||
-          block?.type !== 'tool_use' || block.name !== FOLLOWUP_TOOL.name ||
+          !isRecord(result) || result.stop_reason !== 'tool_use' ||
+          !Array.isArray(content) || content.length !== 1 ||
+          !isRecord(block) || block.type !== 'tool_use' || block.name !== FOLLOWUP_TOOL.name ||
           typeof block.id !== 'string' || !block.id.trim() ||
-          !decision || typeof decision !== 'object' || Array.isArray(decision) ||
+          !isRecord(decision) ||
           Object.keys(decision).length !== 2 ||
           typeof decision.shouldReply !== 'boolean' || typeof decision.reply !== 'string' ||
           (!decision.shouldReply && decision.reply !== '')
@@ -193,15 +253,15 @@ export class ChatEngine {
         text = decision.reply;
       } else {
         if (
-          !Array.isArray(result?.content) || result.content.length === 0 ||
-          result.content.some((block) => block?.type !== 'text' || typeof block.text !== 'string')
+          !isRecord(result) || !Array.isArray(result.content) || result.content.length === 0 ||
+          !result.content.every(isTextBlock)
         ) {
           throw new ChatError('INVALID_RESPONSE');
         }
         text = result.content.map((block) => block.text).join('\n');
       }
       if (!text.trim()) throw new ChatError('INVALID_RESPONSE');
-      const completed = [...messages, { role: 'assistant', content: text }];
+      const completed: ChatMessage[] = [...messages, { role: 'assistant', content: text }];
       let committed = false;
       return {
         text,
