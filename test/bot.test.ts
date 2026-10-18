@@ -61,7 +61,7 @@ async function ioUntil(predicate: () => boolean) {
 function message(id: string, overrides: Partial<LineMessage> = {}) {
   return { type: 'message', message: {
     messageId: id, channelId: 'group', channelKind: 'group',
-    senderId: 'other', senderName: 'Other', contentType: 'TEXT', text: `@${id}`,
+    senderId: 'other', senderName: 'Other', contentType: 'NONE', text: `@${id}`,
     mentions: [{ userId: overrides.channelKind === 'square' ? 'square-self' : 'self', start: 0, end: id.length + 1 }],
     ...overrides,
   } };
@@ -372,7 +372,7 @@ test('name and targeted metadata triggers are direct, then followups can respond
     if (text === 'unrelated') return null;
     return { text: 'answer', commit: () => { committed++; } };
   } });
-  f.send(message('name', { text: '嗨語喵', mentions: [] }));
+  f.send(message('name', { text: '＠語喵', mentions: [] }));
   f.send(message('related', { text: 'related', mentions: [] }));
   f.send(message('unrelated', { text: 'unrelated', mentions: [] }));
   f.send(message('related-again', { text: 'related again', mentions: [] }));

@@ -390,7 +390,8 @@ export class ChatBot {
     if (event.type !== 'message') return;
     const message = event.message;
     if (!isMessage(message) || !this.allowed.has(message.channelId) || (this.channels && !this.channels.has(message.channelId))) return;
-    if (message.contentType !== 'TEXT' || typeof message.text !== 'string' || !message.text.trim() || message.unsent || message.decryptFailed) return;
+    // LINE.js normalizes text content type 0 to NONE, not TEXT.
+    if (message.contentType !== 'NONE' || typeof message.text !== 'string' || !message.text.trim() || message.unsent || message.decryptFailed) return;
     if (typeof message.messageId !== 'string' || !message.messageId || typeof message.senderId !== 'string' || !message.senderId) return;
     const key = JSON.stringify([message.channelId, message.messageId]);
     if (this.seen.has(key)) return;
