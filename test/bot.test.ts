@@ -22,6 +22,9 @@ interface FixtureOptions {
   line?: Partial<LineConfig>;
   handshake?: boolean;
   acknowledge?: boolean;
+  history?: (request: Extract<LineRequest, { type: 'history:fetch' }>) => {
+    messages: unknown[]; hasMore: boolean; cursor?: string; chatId?: string;
+  };
 }
 
 function inputJson(input: string): Record<string, unknown> & { text: string } {
@@ -38,6 +41,12 @@ function requestFrame(data: RawData): LineRequest {
   assert.equal(typeof value.chatId, 'string');
   assert.ok(typeof value.requestId === 'string' && typeof value.chatId === 'string');
   if (value.type === 'chat:admins:get') return { type: value.type, requestId: value.requestId, chatId: value.chatId };
+  if (value.type === 'history:fetch') {
+    assert.equal(value.limit, 100);
+    assert.ok(value.before === undefined || typeof value.before === 'string');
+    return { type: value.type, requestId: value.requestId, chatId: value.chatId,
+      limit: 100, ...(typeof value.before === 'string' ? { before: value.before } : {}) };
+  }
   assert.equal(value.type, 'message:send');
   assert.ok(typeof value.text === 'string' && typeof value.replyTo === 'string');
   return { type: 'message:send', requestId: value.requestId, chatId: value.chatId, text: value.text, replyTo: value.replyTo };
@@ -67,7 +76,7 @@ function message(id: string, overrides: Partial<LineMessage> = {}) {
   } };
 }
 
-async function fixture(t: TestContext, { prepare, line = {}, handshake = true, acknowledge = true }: FixtureOptions = {}) {
+async function fixture(t: TestContext, { prepare, line = {}, handshake = true, acknowledge = true, history }: FixtureOptions = {}) {
   const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
   await once(server, 'listening');
   const calls: PrepareCall[] = [], commits: string[] = [], cleared: string[] = [], requests: LineRequest[] = [], logs: string[] = [];
@@ -90,6 +99,10 @@ async function fixture(t: TestContext, { prepare, line = {}, handshake = true, a
       requests.push(event);
       if (acknowledge && event.type === 'message:send') {
         socket.send(JSON.stringify({ type: 'sent', requestId: event.requestId, messageId: `sent-${requests.length}` }));
+      }
+      if (event.type === 'history:fetch') {
+        const page = history?.(event) ?? { messages: [], hasMore: false };
+        socket.send(JSON.stringify({ type: 'history', requestId: event.requestId, chatId: event.chatId, ...page }));
       }
       if (event.type === 'ping') socket.send(JSON.stringify({ type: 'pong' }));
     });
@@ -362,7 +375,6 @@ test('unengaged chats ignore ordinary text, invalid mentions, @All and unknown r
   await until(() => f.bot.seen.size === ignored.length && f.bot.jobs.size === 0);
   assert.equal(f.calls.length, 0);
   assert.equal(f.sends.length, 0);
-  assert.equal(f.requests.length, 0);
 });
 
 test('name and targeted metadata triggers are direct, then followups can respond or skip', async t => {
@@ -426,7 +438,7 @@ test('observed own messages trigger replies only in their chat and never echo-lo
   assert.equal(f.calls.length, 1);
   assert.deepEqual(f.calls[0].options, { followup: false });
   assert.equal(inputJson(f.calls[0].input).replyTo, 'own-observed');
-  assert.equal(f.requests.filter(event => event.type !== 'message:send').length, 0);
+  assert.equal(f.requests.filter(event => event.type === 'chat:admins:get').length, 0);
 });
 
 test('acknowledged ids survive context clear but withdrawn ids cannot trigger', async t => {
@@ -497,6 +509,75 @@ test('replying to an edited bot message still directly addresses the bot', async
   await until(() => f.commits.length === 1);
   assert.equal(f.sends[0].replyTo, 'reply-edited');
   assert.equal(f.calls[0].options.followup, false);
+});
+
+test('replies to pre-connection bot messages resolve paged history without replaying it', async t => {
+  const f = await fixture(t, { history: request => request.before
+    ? { messages: [message('old-bot', { senderId: 'self', mentions: [] }).message], hasMore: false }
+    : { messages: [message('old-other', { text: '語喵', mentions: [] }).message], hasMore: true, cursor: 'older' },
+  });
+  f.send(message('reply-old', { text: '換個話題好嗎？', mentions: [], replyTo: 'old-bot' }));
+  await until(() => f.commits.length === 1);
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls[0].options.followup, false);
+  assert.equal(f.sends[0].replyTo, 'reply-old');
+  assert.equal(f.requests.filter(event => event.type === 'history:fetch').length, 2);
+  f.send(message('reply-old-again', { text: '還在嗎？', mentions: [], replyTo: 'old-bot' }));
+  await until(() => f.commits.length === 2);
+  assert.equal(f.calls[1].options.followup, false);
+  assert.equal(f.requests.filter(event => event.type === 'history:fetch').length, 2);
+});
+
+for (const target of [
+  { senderId: 'other' },
+  { senderId: 'self', unsent: true },
+  { senderId: 'self', channelId: 'second' },
+]) {
+  test(`history cannot trigger a reply for ${JSON.stringify(target)}`, async t => {
+    const f = await fixture(t, { history: () => ({
+      messages: [message('old', target).message], hasMore: false,
+    }) });
+    f.send(message('reply-old', { mentions: [], replyTo: 'old' }));
+    await until(() => f.bot.seen.size === 1 && f.bot.jobs.size === 0);
+    assert.equal(f.calls.length, 0);
+    assert.equal(f.sends.length, 0);
+  });
+}
+
+test('history cancellation cannot restore a withdrawn target or send a reply', async t => {
+  const f = await fixture(t, { history: () => {
+    f.send({ type: 'message:unsend', chatId: 'group', messageId: 'old' });
+    return { messages: [message('old', { senderId: 'self' }).message], hasMore: false };
+  } });
+  f.send(message('reply-old', { mentions: [], replyTo: 'old' }));
+  await until(() => f.bot.seen.size === 1 && f.bot.jobs.size === 0);
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.bot.ownMessages.size, 0);
+  assert.equal(f.sends.length, 0);
+});
+
+test('non-progressing history stops instead of looping or guessing the quoted author', async t => {
+  const f = await fixture(t, { history: () => ({ messages: [], hasMore: true, cursor: 'same' }) });
+  f.send(message('reply-old', { mentions: [], replyTo: 'old' }));
+  await until(() => f.bot.seen.size === 1 && f.bot.jobs.size === 0);
+  assert.equal(f.requests.filter(event => event.type === 'history:fetch').length, 2);
+  assert.equal(f.calls.length, 0);
+  assert.ok(f.logs.includes('reply_failed'));
+});
+
+test('direct name, mention and quote still respond after an unrelated followup', async t => {
+  const f = await fixture(t, { prepare: ({ options }) => options.followup
+    ? null : { text: '我在，有什麼事？', commit: () => {} },
+  });
+  f.send(message('initial', { text: '語喵', mentions: [] }));
+  await until(() => f.bot.engaged.has('group'));
+  const ownMessageId = `sent-${f.requests.length}`;
+  f.send(message('unrelated', { text: '大家吃飯了嗎？', mentions: [] }));
+  f.send(message('name', { text: '語喵', mentions: [] }));
+  f.send(message('mention', { text: '@Bot', mentions: [{ userId: 'self', start: 0, end: 4 }] }));
+  f.send(message('quote', { text: '換個話題', mentions: [], replyTo: ownMessageId }));
+  await until(() => f.bot.seen.size === 5 && f.bot.jobs.size === 0);
+  assert.deepEqual(f.sends.map(event => event.replyTo), ['initial', 'name', 'mention', 'quote']);
 });
 
 test('ready replies burst promptly but share a rolling minute budget across chats', async t => {

@@ -2,6 +2,7 @@ import WebSocket from 'ws';
 import { randomUUID } from 'node:crypto';
 import type { LineConfig } from './config.js';
 import type { ChatEngineLike } from './chat.js';
+import { isRecord } from './guards.js';
 
 export interface LineMessage {
   channelId: string;
@@ -20,6 +21,7 @@ export interface LineMessage {
 export type LineRequest =
   | { type: 'ping' | 'pong' }
   | { type: 'chat:admins:get'; requestId: string; chatId: string }
+  | { type: 'history:fetch'; requestId: string; chatId: string; limit: number; before?: string }
   | { type: 'message:send'; requestId: string; chatId: string; text: string; replyTo: string };
 
 export interface SentEvent {
@@ -35,7 +37,16 @@ export interface AdminsEvent {
   ownMemberId?: unknown;
 }
 
-type ResponseEvent = SentEvent | AdminsEvent;
+interface HistoryEvent {
+  type: 'history';
+  requestId: string;
+  chatId?: unknown;
+  messages?: unknown;
+  hasMore?: unknown;
+  cursor?: unknown;
+}
+
+type ResponseEvent = SentEvent | AdminsEvent | HistoryEvent;
 type PendingRequest = {
   type: ResponseEvent['type'];
   chatId: string;
@@ -49,6 +60,7 @@ export type LineEvent =
   | { type: 'auth:state'; state?: unknown }
   | { type: 'auth:ready'; profile?: unknown }
   | { type: 'sent' | 'chat:admins' | 'error'; requestId?: unknown; messageId?: unknown; chatId?: unknown; ownMemberId?: unknown }
+  | { type: 'history'; requestId?: unknown; chatId?: unknown; messages?: unknown; hasMore?: unknown; cursor?: unknown }
   | { type: 'channels'; channels?: unknown }
   | { type: 'message'; message?: unknown }
   | { type: 'message:edit'; message?: unknown }
@@ -58,7 +70,7 @@ function isLineEvent(value: unknown): value is LineEvent {
   if (value === null || typeof value !== 'object' || !('type' in value)) return false;
   switch (value.type) {
     case 'ping': case 'pong': case 'hello': case 'auth:state': case 'auth:ready':
-    case 'sent': case 'chat:admins': case 'error': case 'channels':
+    case 'sent': case 'chat:admins': case 'history': case 'error': case 'channels':
     case 'message': case 'message:edit': case 'message:unsend':
       return true;
     default:
@@ -297,6 +309,33 @@ export class ChatBot {
       this.ownMessages.has(JSON.stringify([message.channelId, message.replyTo]));
   }
 
+  async isHistoricalReply(message: LineMessage, ownId: string, signal: AbortSignal): Promise<boolean> {
+    if (typeof message.replyTo !== 'string' || !message.replyTo) return false;
+    const cursors = new Set<string>();
+    let before: string | undefined;
+    while (!signal.aborted) {
+      const page = await this.request('history:fetch', {
+        chatId: message.channelId, limit: 100, ...(before ? { before } : {}),
+      }, 'history', signal);
+      if (page.type !== 'history' || page.chatId !== message.channelId ||
+          !Array.isArray(page.messages) || typeof page.hasMore !== 'boolean') throw failure('invalid_history');
+      const target: unknown = page.messages.find((entry: unknown) =>
+        isRecord(entry) && entry.channelId === message.channelId && entry.messageId === message.replyTo);
+      if (isRecord(target)) {
+        if (target.senderId !== ownId || target.unsent) return false;
+        this.rememberOwn(message.channelId, message.replyTo);
+        return true;
+      }
+      if (!page.hasMore) return false;
+      if (typeof page.cursor !== 'string' || !page.cursor || cursors.has(page.cursor)) throw failure('invalid_history');
+      before = page.cursor;
+      cursors.add(before);
+      // LINE.js limits history requests to ten per second per connection.
+      await delay(100, signal);
+    }
+    return false;
+  }
+
   ping() {
     if (this.stopped || this.heartbeatDeadline) return;
     try {
@@ -345,7 +384,7 @@ export class ChatBot {
       this.log('ready');
       return;
     }
-    if (event.type === 'sent' || event.type === 'chat:admins' || event.type === 'error') {
+    if (event.type === 'sent' || event.type === 'chat:admins' || event.type === 'history' || event.type === 'error') {
       if (typeof event.requestId !== 'string') return;
       const pending = this.pending.get(event.requestId);
       if (!pending) return;
@@ -446,7 +485,8 @@ export class ChatBot {
       this.rememberOwn(message.channelId, message.messageId);
       return;
     }
-    const direct = this.isDirect(message, ownId);
+    const direct = this.isDirect(message, ownId) || await this.isHistoricalReply(message, ownId, signal);
+    if (signal.aborted) return;
     if (!direct && !this.engaged.has(message.channelId)) return;
     const name = typeof message.senderName === 'string' ? message.senderName : message.senderId;
     const input = JSON.stringify({
@@ -499,6 +539,7 @@ export class ChatBot {
   request(
     ...[type, payload, expectedType, signal]:
       | [type: 'chat:admins:get', payload: { chatId: string }, expectedType: 'chat:admins', signal: AbortSignal]
+      | [type: 'history:fetch', payload: { chatId: string; limit: number; before?: string }, expectedType: 'history', signal: AbortSignal]
       | [type: 'message:send', payload: { chatId: string; text: string; replyTo: string }, expectedType: 'sent', signal: AbortSignal]
   ): Promise<ResponseEvent> {
     if (signal.aborted) return Promise.reject(failure('cancelled'));
@@ -521,6 +562,7 @@ export class ChatBot {
       signal.addEventListener('abort', cancel, { once: true });
       try {
         if (type === 'message:send') this.send({ type, requestId, ...payload });
+        else if (type === 'history:fetch') this.send({ type, requestId, ...payload });
         else this.send({ type, requestId, ...payload });
       } catch {
         finish(reject, failure('disconnected'));

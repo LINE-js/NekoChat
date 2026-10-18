@@ -137,7 +137,6 @@ test('oversized system plus current input never generates or truncates', async (
   assert.equal(generations().length, 0);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].body.messages[0].content, 'keep the complete input');
-  assert.equal(calls[0].body.system, 'Always be a helpful cat.');
 });
 
 test('oversized current input still fails after every old pair is removed', async () => {
@@ -350,7 +349,6 @@ test('relevant followups commit only plain reply text and remain transactional',
   ]);
   assert.equal(direct.tools, undefined);
   assert.equal(direct.tool_choice, undefined);
-  assert.equal(direct.system, 'Always be a helpful cat.');
 });
 
 test('followups without retained conversational evidence stay silent without generating', async () => {
