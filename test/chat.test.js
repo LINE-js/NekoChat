@@ -328,7 +328,7 @@ test('followup counts include identical decision system, tools and choice at the
   await engine.prepare('chat', 'followup', undefined, { followup: true });
   const generated = generations().at(-1).body;
   const counted = calls.findLast((call) => call.url.endsWith('/count_tokens')).body;
-  const { max_tokens, ...input } = generated;
+  const { max_tokens, cache_control, ...input } = generated;
   assert.equal(max_tokens, 1_000);
   assert.deepEqual(counted, input);
 });

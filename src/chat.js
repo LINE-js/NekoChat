@@ -170,6 +170,7 @@ export class ChatEngine {
         ...requestOptions,
         messages,
         max_tokens: this.#claude.maxOutputTokens,
+        cache_control: { type: 'ephemeral' },
       }, 'GENERATION_FAILED');
       if (result?.stop_reason === 'max_tokens') throw new ChatError('OUTPUT_TRUNCATED');
       let text;
