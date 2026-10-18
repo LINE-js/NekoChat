@@ -22,7 +22,7 @@ npm install
 ./start.sh
 ```
 
-`start.sh` 可從任意工作目錄執行，會先檢查 Node.js ≥ 22 與依賴；缺少依賴時提示執行 `npm ci`，不會自動安裝或覆蓋設定。`--check` 只驗證本機設定，不呼叫外部服務。指定其他設定檔可使用 `./start.sh --config /path/to/config.yaml`，相對設定路徑以專案目錄為基準；按 Ctrl+C 停止。修改設定後須重啟。原有 `npm start`、`npm run check` 仍可使用。
+`start.sh` 可從任意工作目錄執行，會先檢查 Node.js ≥ 22 與依賴；依賴無法載入時自動執行 `npm ci --ignore-scripts`，依照 lockfile 重建 `node_modules`，不執行套件安裝腳本，也不會覆蓋設定。需要 npm；安裝失敗或安裝後仍無法載入依賴時停止啟動。`--check` 只驗證本機設定，不連線 LINE 或 Anthropic，但缺少依賴時仍會觸發安裝，可能連線 npm registry。指定其他設定檔可使用 `./start.sh --config /path/to/config.yaml`，相對設定路徑以專案目錄為基準；按 Ctrl+C 停止。修改設定後須重啟。原有 `npm start`、`npm run check` 仍可使用，但不會自動安裝依賴。
 
 `line.chats` 不得留空；只有同時在 LINE.js 與 NekoChat 白名單內的聊天室會被處理。初次只在引用回覆語喵、LINE @ 標記語喵，或文字包含「語喵」時接話。接話後由 Claude 判斷後續訊息是否延續與語喵的對話，無關或不確定時保持安靜。請確認群組成員同意將訊息送往 Anthropic；建議先用測試群與次要 LINE 帳號驗證。
 
