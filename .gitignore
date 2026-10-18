@@ -1,0 +1,10 @@
+node_modules/
+config.json
+config.yaml
+config.yml
+*.local.json
+.env
+.env.*
+!.env.example
+coverage/
+.DS_Store

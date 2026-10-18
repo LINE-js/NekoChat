@@ -1,0 +1,20 @@
+{
+  "name": "nekochat",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Claude chat extension for the LINE.js /api/ws bot API",
+  "type": "module",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/main.js",
+    "check": "node src/main.js --check",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "ws": "8.22.0",
+    "yaml": "2.9.1"
+  }
+}

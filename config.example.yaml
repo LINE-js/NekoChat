@@ -1,0 +1,16 @@
+line:
+  url: "ws://127.0.0.1:3789/api/ws"
+  token: ""
+  chats: []
+  ownMemberIds: {}
+  textMaxLength: 8000
+  sendsPerMinute: 20
+
+claude:
+  apiKey: ""
+  model: "claude-haiku-5-5"
+  contextTokens: 100000
+  maxOutputTokens: 4096
+  timeoutMs: 60000
+
+personalityFile: "personality.md"
