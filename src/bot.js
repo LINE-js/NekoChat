@@ -64,6 +64,7 @@ export class ChatBot {
     this.ownMessages = new Map();
     this.rateQueue = Promise.resolve();
     this.lastSend = 0;
+    this.sendTimes = [];
     this.stopped = false;
     this.started = false;
     this.ready = false;
@@ -347,11 +348,22 @@ export class ChatBot {
   rateLimit(signal) {
     const slot = this.rateQueue.then(async () => {
       if (signal.aborted) throw failure('cancelled');
-      const interval = Math.max(250, Math.ceil(60_000 / this.config.line.sendsPerMinute));
-      const remaining = this.lastSend + interval - Date.now();
-      if (remaining > 0) await delay(remaining, signal);
-      if (signal.aborted) throw failure('cancelled');
-      this.lastSend = Date.now();
+      // Permit short bursts without exceeding the server's rolling minute budget.
+      while (true) {
+        const now = Date.now();
+        this.sendTimes = this.sendTimes.filter(time => now - time < 60_000);
+        const minuteReady = this.sendTimes.length >= this.config.line.sendsPerMinute
+          ? this.sendTimes[0] + 60_000 : 0;
+        const remaining = Math.max(this.lastSend + 250, minuteReady) - now;
+        if (remaining > 0) {
+          await delay(remaining, signal);
+          continue;
+        }
+        if (signal.aborted) throw failure('cancelled');
+        this.lastSend = now;
+        this.sendTimes.push(now);
+        break;
+      }
     });
     this.rateQueue = slot.catch(() => {});
     return slot;

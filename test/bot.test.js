@@ -451,3 +451,42 @@ test('replying to an edited bot message still directly addresses the bot', async
   assert.equal(f.sends[0].replyTo, 'reply-edited');
   assert.equal(f.calls[0].options.followup, false);
 });
+
+test('ready replies burst promptly but share a rolling minute budget across chats', async t => {
+  const f = await fixture(t, { line: { sendsPerMinute: 2 } });
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
+  f.send(message('first'));
+  await ioUntil(() => f.commits.length === 1);
+  f.send(message('second', { channelId: 'second' }));
+  await ioUntil(() => f.calls.length === 2);
+  t.mock.timers.tick(249);
+  await new Promise(setImmediate);
+  assert.equal(f.sends.length, 1);
+  t.mock.timers.tick(1);
+  await ioUntil(() => f.commits.length === 2);
+  f.send(message('third'));
+  await ioUntil(() => f.calls.length === 3);
+  t.mock.timers.tick(59_749);
+  await new Promise(setImmediate);
+  assert.equal(f.sends.length, 2);
+  t.mock.timers.tick(1);
+  await ioUntil(() => f.commits.length === 3);
+  assert.deepEqual(f.sends.map(frame => frame.replyTo), ['first', 'second', 'third']);
+});
+
+test('cancelling a reply waiting for minute budget never sends it later', async t => {
+  const f = await fixture(t, { line: { sendsPerMinute: 1 } });
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
+  f.send(message('first'));
+  await ioUntil(() => f.commits.length === 1);
+  f.send(message('cancelled', { channelId: 'second' }));
+  await ioUntil(() => f.calls.length === 2);
+  f.send({ type: 'message:unsend', chatId: 'second', messageId: 'cancelled' });
+  await ioUntil(() => f.calls[1].signal.aborted && f.bot.jobs.size === 0);
+  t.mock.timers.tick(60_000);
+  await new Promise(setImmediate);
+  assert.equal(f.sends.length, 1);
+  f.send(message('replacement', { channelId: 'second' }));
+  await ioUntil(() => f.commits.length === 2);
+  assert.deepEqual(f.sends.map(frame => frame.replyTo), ['first', 'replacement']);
+});

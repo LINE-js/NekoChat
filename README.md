@@ -35,7 +35,7 @@ npm start
 | `line.chats` | 要回覆的聊天室 ID 陣列 |
 | `line.ownMemberIds` | 選填，聊天室 ID 對應自己在社群的成員 ID；未填時以 `chat:admins:get` 查詢，無法確認自身身分便不回覆該社群 |
 | `line.textMaxLength` | 每段 LINE 文字的 UTF-16 長度上限，預設 8000；須不超過 LINE.js 設定 |
-| `line.sendsPerMinute` | 本元件的全域發送速率，預設 20；不得高於 LINE.js 上限，多個機器人須自行分配額度 |
+| `line.sendsPerMinute` | 本元件所有聊天室共用的滾動 60 秒發送上限，預設 20；不得高於 LINE.js 上限，多個機器人須自行分配額度 |
 | `claude.apiKey` | Anthropic API key，僅供伺服器使用 |
 | `claude.model` | `claude-haiku-5-5`，不會自動換用其他模型 |
 | `claude.contextTokens` | 100000；可降低，不可提高 |
@@ -55,6 +55,7 @@ npm start
 - 生成請求啟用 Anthropic [5 分鐘自動 prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)，重用相同人格與歷史前綴的計算，不是快取整份回答，也不省略 token 計數。首次寫入按官方快取寫入費率計價，命中後按較低讀取費率計價；快取可能到期或因直接回答／關聯度判斷的提示與工具不同而失效。快取由 Anthropic 管理，清除本機對話不代表立即刪除上游快取；不保證短對話每輪都更快。
 - 模型出錯、計數失敗或回答因輸出額度截斷時，不傳送不完整回答，終端機記錄安全錯誤代碼，不輸出金鑰或訊息原文。
 - 長回答分段發送，不拆開 Unicode surrogate pair；所有段落取得 `sent` 確認後，才將完整問答納入上下文。部分發送失敗不回滾已送出的段落，也不自動重送。
+- 已準備好的回答在有額度時可每 250ms 發送一段，不再將每分鐘額度平均攤成固定等待。所有聊天室共用滾動 60 秒總量上限；額度耗盡才等待最早一次發送到期，斷線不會重設這份限流紀錄。等待中被取消的回答不會在稍後自動補送。Claude 生成與 LINE 確認仍需各自的網路時間。
 - 不回覆自己的訊息、歷史 snapshot、已收回或解密失敗的訊息、非文字訊息；保留最近 10000 個訊息 ID 去重。
 - 與 LINE.js 斷線、初次連線失敗、心跳失敗時，**每次失敗後等待 10 秒重連**。WebSocket handshake 最多等待 10 秒；連線後每 30 秒 ping，10 秒未收到 pong 即重連。關閉程式會取消重連。
 - 斷線或登出會取消待處理回答、清空上下文與身分資訊。重連後重新等待登入狀態，只處理新事件；不補抓斷線期間的訊息，也不重送結果不明的發送請求。去重資料跨重連保留、程式重啟則清除。
