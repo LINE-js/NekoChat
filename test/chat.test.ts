@@ -2,7 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
-import { gunzipSync } from 'node:zlib';
+import { setImmediate } from 'node:timers/promises';
+import type { Transform, TransformCallback } from 'node:stream';
+import { createGzip, gunzipSync } from 'node:zlib';
 import { ChatEngine, ChatError } from '../src/chat.js';
 import type { ChatFetchOptions, ChatMessage } from '../src/chat.js';
 import type { ClaudeConfig } from '../src/config.js';
@@ -128,6 +130,135 @@ test('drops only the oldest complete pair and counts the retained request', asyn
   assert.deepEqual(generations()[3].body.messages.map((message) => message.content), [
     'third', 'answer:third', 'fourth',
   ]);
+});
+
+test('64-pair overflow drops only turn0 with two count requests', async () => {
+  const { engine, calls, generations } = harness({
+    count: (body) => body.messages.at(-1)?.content === 'turn64' &&
+      body.messages.length > 127 ? 91 : 90,
+  });
+  for (let turn = 0; turn < 64; turn++) {
+    (await engine.prepare('chat', `turn${turn}`)).commit();
+  }
+  calls.length = 0;
+  const turn = await engine.prepare('chat', 'turn64');
+  const counts = calls.filter((call) => call.url.endsWith('/count_tokens'));
+  assert.equal(counts.length, 2);
+  assert.equal(counts[0].body.messages.length, 129);
+  assert.equal(counts[1].body.messages.length, 127);
+  const generated = generations()[0].body;
+  assert.equal(generated.messages[0].content, 'turn1');
+  assert.equal(generated.messages.at(-1)?.content, 'turn64');
+  assert.deepEqual(generated.messages, counts[1].body.messages);
+  assert.equal(generated.system, counts[1].body.system);
+  turn.commit();
+  await engine.prepare('chat', 'next');
+  assert.equal(generations().at(-1)?.body.messages[0].content, 'turn1');
+});
+
+test('minimal trimming handles every boundary without counting a candidate twice', async () => {
+  for (const pairCount of [1, 2, 3, 8]) {
+    for (let dropped = 1; dropped <= pairCount; dropped++) {
+      const retainedLength = (pairCount - dropped) * 2 + 1;
+      const { engine, calls, generations } = harness({
+        count: (body) => body.messages.at(-1)?.content === 'next' &&
+          body.messages.length > retainedLength ? 91 : 90,
+      });
+      for (let turn = 0; turn < pairCount; turn++) {
+        (await engine.prepare('chat', `turn${turn}`)).commit();
+      }
+      calls.length = 0;
+      await engine.prepare('chat', 'next');
+      const counts = calls.filter((call) => call.url.endsWith('/count_tokens'));
+      const lengths = counts.map((call) => call.body.messages.length);
+      assert.equal(new Set(lengths).size, lengths.length);
+      const generated = generations()[0].body;
+      assert.deepEqual(generated.messages.map((message) => message.content), [
+        ...Array.from({ length: pairCount - dropped }, (_, turn) => [
+          `turn${turn + dropped}`, `answer:turn${turn + dropped}`,
+        ]).flat(),
+        'next',
+      ]);
+      assert.ok(counts.some(({ body }) =>
+        body.system === generated.system &&
+        JSON.stringify(body.messages) === JSON.stringify(generated.messages)));
+    }
+  }
+});
+
+test('failed trimming counts never generate or change committed history', async () => {
+  for (const failedLength of [7, 1, 3]) {
+    for (const failure of [NaN, new Response('upstream failure', { status: 429 })]) {
+      const { engine, calls, generations } = harness({
+        count: (body) => {
+          if (body.messages.at(-1)?.content !== 'next') return 20;
+          if (body.messages.length === failedLength) return failure;
+          return body.messages.length === 1 ? 20 : 91;
+        },
+      });
+      for (let turn = 0; turn < 4; turn++) {
+        (await engine.prepare('chat', `turn${turn}`)).commit();
+      }
+      calls.length = 0;
+      await assert.rejects(engine.prepare('chat', 'next'), hasCode(
+        'COUNT_FAILED', failure instanceof Response ? 429 : undefined,
+      ));
+      assert.equal(generations().length, 0);
+      await engine.prepare('chat', 'small');
+      assert.deepEqual(generations()[0].body.messages.map((message) => message.content), [
+        'turn0', 'answer:turn0', 'turn1', 'answer:turn1',
+        'turn2', 'answer:turn2', 'turn3', 'answer:turn3', 'small',
+      ]);
+    }
+  }
+});
+
+test('abort and timeout during trimming preserve committed history', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  for (const code of ['ABORTED', 'TIMEOUT']) {
+    for (const stoppedLength of [7, 1, 3]) {
+      const controller = new AbortController();
+      const { engine, calls, generations } = harness({
+        count: (body) => {
+          if (body.messages.at(-1)?.content !== 'next') return 20;
+          if (body.messages.length === stoppedLength) {
+            if (code === 'ABORTED') controller.abort();
+            else t.mock.timers.tick(claude.timeoutMs);
+          }
+          return body.messages.length === 1 ? 20 : 91;
+        },
+      });
+      for (let turn = 0; turn < 4; turn++) {
+        (await engine.prepare('chat', `turn${turn}`)).commit();
+      }
+      calls.length = 0;
+      await assert.rejects(engine.prepare('chat', 'next', controller.signal), hasCode(code));
+      assert.equal(generations().length, 0);
+      await engine.prepare('chat', 'small');
+      assert.equal(generations()[0].body.messages[0].content, 'turn0');
+      assert.equal(generations()[0].body.messages.length, 9);
+    }
+  }
+});
+
+test('oversized current input is counted intact without repeating trim boundaries', async () => {
+  const input = 'keep the complete oversized input';
+  const { engine, calls, generations } = harness({
+    count: (body) => body.messages.at(-1)?.content === input ? 91 : 20,
+  });
+  for (const turn of ['first', 'second']) {
+    (await engine.prepare('chat', turn)).commit();
+  }
+  calls.length = 0;
+  await assert.rejects(engine.prepare('chat', input), hasCode('CONTEXT_TOO_LARGE'));
+  assert.equal(generations().length, 0);
+  assert.deepEqual(calls.map(({ body }) => body.messages.length), [5, 3, 1]);
+  for (const { body } of calls) {
+    assert.equal(body.messages.at(-1)?.content, input);
+    assert.equal(body.system, calls[0].body.system);
+  }
+  await engine.prepare('chat', 'small');
+  assert.equal(generations()[0].body.messages[0].content, 'first');
 });
 
 test('can discard all history while preserving the newest input', async () => {
@@ -263,24 +394,96 @@ test('timeout aborts the fetch and returns a safe TIMEOUT error', async () => {
   assert.equal(fetchSignal.aborted, true);
 });
 
-test('cancellation during compression prevents uploading a cancelled turn', async () => {
+for (const code of ['ABORTED', 'TIMEOUT']) {
+  test(`${code} settles before a pending compression callback and destroys its stream`, async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const probe = createGzip();
+    const prototype = Object.getPrototypeOf(probe) as Transform;
+    probe.destroy();
+    let stream: Transform | undefined;
+    let complete: TransformCallback | undefined;
+    let completed = false;
+    t.mock.method(prototype, '_transform', function (
+      this: Transform, _chunk: Buffer, _encoding: BufferEncoding, callback: TransformCallback,
+    ) {
+      stream = this;
+      complete = () => {
+        if (completed) return;
+        completed = true;
+        callback();
+      };
+    });
+    t.after(() => complete?.());
+    const { engine, calls } = harness();
+    const controller = new AbortController();
+    let settled = false;
+    const outcome = engine.prepare('chat', '中文'.repeat(10_000), controller.signal).then(
+      () => { settled = true; return null; },
+      (error: unknown) => { settled = true; return error; },
+    );
+    assert.ok(stream);
+    assert.ok(complete);
+    if (code === 'ABORTED') controller.abort();
+    else t.mock.timers.tick(claude.timeoutMs);
+    // One event-loop turn is a condition barrier, not a compression-duration threshold.
+    await setImmediate();
+    assert.equal(completed, false);
+    assert.equal(settled, true);
+    assert.equal(stream.destroyed, true);
+    hasCode(code)(await outcome);
+    assert.equal(calls.length, 0);
+    complete();
+    assert.equal(calls.length, 0);
+    await engine.prepare('chat', 'next');
+    assert.deepEqual(calls.at(-1)?.body.messages, [{ role: 'user', content: 'next' }]);
+  });
+}
+
+test('gzip preserves large UTF8 JSON requests and small requests stay uncompressed', async () => {
   const { engine, calls } = harness();
-  const controller = new AbortController();
-  const pending = engine.prepare('chat', '中文'.repeat(10_000), controller.signal);
-  controller.abort();
-  await assert.rejects(pending, hasCode('ABORTED'));
-  assert.equal(calls.length, 0);
-  await engine.prepare('chat', 'next');
-  assert.deepEqual(calls.at(-1)?.body.messages, [{ role: 'user', content: 'next' }]);
+  await engine.prepare('small', 'hello');
+  assert.ok(calls.every(({ options }) => typeof options.body === 'string' &&
+    options.headers['content-encoding'] === undefined));
+  calls.length = 0;
+  const input = '中文🐱'.repeat(1_000);
+  await engine.prepare('large', input);
+  assert.equal(calls.length, 2);
+  for (const { options, body } of calls) {
+    assert.equal(options.headers['content-encoding'], 'gzip');
+    assert.ok(typeof options.body !== 'string');
+    const json = gunzipSync(options.body).toString('utf8');
+    assert.ok(options.body.byteLength < Buffer.byteLength(json));
+    assert.equal(body.messages[0]?.content, input);
+    assert.deepEqual(JSON.parse(json).messages, [{ role: 'user', content: input }]);
+  }
 });
 
-test('timeout during compression prevents uploading after the turn deadline', async (t) => {
-  t.mock.timers.enable({ apis: ['setTimeout'] });
+test('compression uses the UTF8 byte gate and skips payloads that would not shrink', async (t) => {
+  const probe = createGzip();
+  const prototype = Object.getPrototypeOf(probe) as Transform;
+  probe.destroy();
+  let compressed = 0;
+  t.mock.method(prototype, '_transform', function (
+    this: Transform, chunk: Buffer, _encoding: BufferEncoding, callback: TransformCallback,
+  ) {
+    // Return the original bytes: deterministic non-shrinking output, including the flush.
+    if (chunk.byteLength) {
+      compressed++;
+      this.push(chunk);
+    }
+    callback();
+  });
   const { engine, calls } = harness();
-  const pending = engine.prepare('chat', '中文'.repeat(10_000));
-  t.mock.timers.tick(claude.timeoutMs);
-  await assert.rejects(pending, hasCode('TIMEOUT'));
-  assert.equal(calls.length, 0);
+  const input = '中'.repeat(1_300);
+  await engine.prepare('chat', input);
+  assert.equal(compressed, 2);
+  for (const { options, body } of calls) {
+    assert.equal(typeof options.body, 'string');
+    assert.equal(options.headers['content-encoding'], undefined);
+    assert.equal(body.messages[0]?.content, input);
+    assert.ok(typeof options.body === 'string' && options.body.length < 4096);
+    assert.ok(Buffer.byteLength(options.body) >= 4096);
+  }
 });
 
 test('HTTP failures stop unfinished response transfers without waiting for their bodies', { timeout: 5_000 }, async (t) => {
@@ -427,6 +630,41 @@ test('followups without retained conversational evidence stay silent without gen
   const before = calls.length;
   assert.equal(await engine.prepare('chat', 'after clear', undefined, { followup: true }), null);
   assert.equal(calls.length, before);
+});
+
+test('followup trimming retains minimal evidence or stays silent without changing history', async () => {
+  for (const dropped of [1, 2, 4]) {
+    const { engine, calls, generations } = followupHarness({
+      count: (body) => body.tools && body.messages.length > (4 - dropped) * 2 + 1 ? 91 : 20,
+    });
+    for (let turn = 0; turn < 4; turn++) {
+      (await engine.prepare('chat', `turn${turn}`)).commit();
+    }
+    calls.length = 0;
+    const turn = await engine.prepare('chat', 'followup', undefined, { followup: true });
+    const counts = calls.filter((call) => call.url.endsWith('/count_tokens'));
+    const lengths = counts.map(({ body }) => body.messages.length);
+    assert.equal(new Set(lengths).size, lengths.length);
+    if (dropped === 4) {
+      assert.equal(turn, null);
+      assert.equal(generations().length, 0);
+    } else {
+      assert.ok(turn);
+      const generated = generations()[0].body;
+      assert.equal(generated.messages[0].content, `turn${dropped}`);
+      assert.equal(generated.messages.length, (4 - dropped) * 2 + 1);
+      assert.ok(counts.some(({ body }) => JSON.stringify(body) === JSON.stringify({
+        model: generated.model,
+        system: generated.system,
+        messages: generated.messages,
+        tools: generated.tools,
+        tool_choice: generated.tool_choice,
+      })));
+      turn.commit();
+    }
+    await engine.prepare('chat', 'direct');
+    assert.equal(generations().at(-1)?.body.messages[0].content, `turn${dropped === 4 ? 0 : dropped}`);
+  }
 });
 
 test('followup counts include identical decision system, tools and choice at the 100K boundary', async () => {

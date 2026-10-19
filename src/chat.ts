@@ -1,5 +1,4 @@
-import { promisify } from 'node:util';
-import { constants, gzip } from 'node:zlib';
+import { constants, createGzip } from 'node:zlib';
 import type { ClaudeConfig } from './config.js';
 import { isRecord } from './guards.js';
 
@@ -57,7 +56,50 @@ function isTextBlock(value: unknown): value is { type: 'text'; text: string } {
 const API_ROOT = 'https://api.anthropic.com/v1';
 const MAX_CONTEXT_TOKENS = 100_000;
 const COMPRESS_MIN_BYTES = 4096;
-const compress = promisify(gzip);
+
+function compress(json: string, signal: AbortSignal): Promise<Buffer<ArrayBuffer>> {
+  signal.throwIfAborted();
+  const { promise, resolve, reject } = Promise.withResolvers<Buffer<ArrayBuffer>>();
+  const stream = createGzip({ level: constants.Z_BEST_SPEED });
+  const chunks: Buffer<ArrayBuffer>[] = [];
+  let bytes = 0;
+  const cleanup = () => {
+    signal.removeEventListener('abort', onAbort);
+    stream.removeListener('data', onData);
+    stream.removeListener('end', onEnd);
+    chunks.length = 0;
+  };
+  const onData = (chunk: Buffer<ArrayBuffer>) => {
+    chunks.push(chunk);
+    bytes += chunk.byteLength;
+  };
+  const onEnd = () => {
+    const compressed = chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks, bytes);
+    cleanup();
+    resolve(compressed);
+  };
+  const onError = (error: Error) => {
+    cleanup();
+    reject(error);
+  };
+  const onAbort = () => {
+    cleanup();
+    // Native work already dispatched may finish, but cannot produce more output or delay rejection.
+    stream.destroy();
+    reject(signal.reason);
+  };
+  stream.on('data', onData);
+  stream.once('end', onEnd);
+  // Keep the error handler until close, including errors arriving after cancellation.
+  stream.on('error', onError);
+  stream.once('close', () => {
+    cleanup();
+    stream.removeListener('error', onError);
+  });
+  signal.addEventListener('abort', onAbort, { once: true });
+  stream.end(json);
+  return promise;
+}
 
 const DIRECT_SYSTEM = `
 The application has verified that the latest member message directly replies to you,
@@ -182,7 +224,7 @@ export class ChatEngine implements ChatEngineLike {
         };
         // Avoid blocking other chats or making small/incompressible uploads larger.
         if (bytes >= COMPRESS_MIN_BYTES) {
-          const compressed = await compress(json, { level: constants.Z_BEST_SPEED });
+          const compressed = await compress(json, controller.signal);
           if (compressed.byteLength < bytes) {
             payload = compressed;
             headers['content-encoding'] = 'gzip';
@@ -233,20 +275,24 @@ export class ChatEngine implements ChatEngineLike {
       let messages = messagesAfter(0);
       if (!await count(messages)) {
         if (pairCount === 0) throw new ChatError('CONTEXT_TOO_LARGE');
-        messages = messagesAfter(pairCount);
-        if (!await count(messages)) throw new ChatError('CONTEXT_TOO_LARGE');
+        messages = messagesAfter(1);
+        if (!await count(messages)) {
+          if (pairCount === 1) throw new ChatError('CONTEXT_TOO_LARGE');
+          messages = messagesAfter(pairCount);
+          if (!await count(messages)) throw new ChatError('CONTEXT_TOO_LARGE');
 
-        // Find the smallest number of complete turns to drop; never split a turn.
-        let low = 1;
-        let high = pairCount;
-        while (low < high) {
-          const middle = Math.floor((low + high) / 2);
-          const candidate = messagesAfter(middle);
-          if (await count(candidate)) {
-            high = middle;
-            messages = candidate;
-          } else {
-            low = middle + 1;
+          // One dropped pair failed and all dropped pairs fit; neither needs recounting.
+          let low = 2;
+          let high = pairCount;
+          while (low < high) {
+            const middle = Math.floor((low + high) / 2);
+            const candidate = messagesAfter(middle);
+            if (await count(candidate)) {
+              high = middle;
+              messages = candidate;
+            } else {
+              low = middle + 1;
+            }
           }
         }
         // The retained candidate is always one that the count endpoint accepted.
