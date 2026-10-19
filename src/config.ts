@@ -11,6 +11,8 @@ export interface LineConfig {
   ownMemberIds: Record<string, string>;
   textMaxLength: number;
   sendsPerMinute: number;
+  maxPendingPerChat: number;
+  maxPendingTotal: number;
 }
 
 export interface ClaudeConfig {
@@ -94,6 +96,11 @@ export async function loadConfig(filename = 'config.yaml'): Promise<{ config: Co
   const sendsPerMinute = line.sendsPerMinute ?? 20;
   integer(textMaxLength, 2, 8000, 'line.textMaxLength');
   integer(sendsPerMinute, 1, 120, 'line.sendsPerMinute');
+  const maxPendingPerChat = line.maxPendingPerChat === undefined ? 50 : line.maxPendingPerChat;
+  const maxPendingTotal = line.maxPendingTotal === undefined ? 200 : line.maxPendingTotal;
+  integer(maxPendingPerChat, 1, 10000, 'line.maxPendingPerChat');
+  integer(maxPendingTotal, 1, 10000, 'line.maxPendingTotal');
+  requireValue(maxPendingPerChat <= maxPendingTotal, 'line.maxPendingPerChat 不能大於 line.maxPendingTotal。');
   const { apiKey, model, contextTokens, maxOutputTokens, timeoutMs } = claude;
   requireValue(typeof apiKey === 'string' && /^[\x21-\x7e]+$/.test(apiKey), '請填入 claude.apiKey。');
   requireValue(typeof model === 'string' && model.trim().length > 0, '請填入 claude.model。');
@@ -107,7 +114,7 @@ export async function loadConfig(filename = 'config.yaml'): Promise<{ config: Co
   catch { throw new ConfigError('無法讀取 personalityFile 指定的個性檔案。'); }
   requireValue(system.trim().length > 0, 'personalityFile 不能是空白檔案。');
   const config: Config = {
-    line: { url: lineUrl, token, chats, ownMemberIds, textMaxLength, sendsPerMinute },
+    line: { url: lineUrl, token, chats, ownMemberIds, textMaxLength, sendsPerMinute, maxPendingPerChat, maxPendingTotal },
     claude: { apiKey, model, contextTokens, maxOutputTokens, timeoutMs },
     personalityFile,
   };

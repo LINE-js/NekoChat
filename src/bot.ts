@@ -54,6 +54,17 @@ type PendingRequest = {
   reject(error: Error): void;
 };
 
+interface WaitingMessage {
+  message: LineMessage;
+  queue: MessageQueue;
+}
+
+interface MessageQueue {
+  chatId: string;
+  waiting: WaitingMessage[];
+  active?: AbortController;
+}
+
 export type LineEvent =
   | { type: 'ping' | 'pong' }
   | { type: 'hello'; protocol?: unknown; capabilities?: unknown }
@@ -142,14 +153,17 @@ export class ChatBot {
   allowed: Set<string>;
   pending: Map<string, PendingRequest>;
   identities: Map<string, Promise<string>>;
-  jobs: Map<string, Set<AbortController>>;
-  queues: Map<string, Promise<void>>;
+  jobs: Map<string, MessageQueue>;
+  waiting: Set<WaitingMessage>;
+  outstanding: number;
   seen: Map<string, boolean>;
   engaged: Set<string>;
-  ownMessages: Map<string, string>;
+  referenceAuthors: Map<string, { chatId: string; own: boolean }>;
   rateQueue: Promise<void>;
   lastSend: number;
   sendTimes: number[];
+  queryQueue: Promise<void>;
+  queryTimes: number[];
   stopped: boolean;
   started: boolean;
   ready: boolean;
@@ -173,13 +187,16 @@ export class ChatBot {
     this.pending = new Map();
     this.identities = new Map();
     this.jobs = new Map();
-    this.queues = new Map();
+    this.waiting = new Set();
+    this.outstanding = 0;
     this.seen = new Map();
     this.engaged = new Set();
-    this.ownMessages = new Map();
+    this.referenceAuthors = new Map();
     this.rateQueue = Promise.resolve();
     this.lastSend = 0;
     this.sendTimes = [];
+    this.queryQueue = Promise.resolve();
+    this.queryTimes = [];
     this.stopped = false;
     this.started = false;
     this.ready = false;
@@ -252,6 +269,7 @@ export class ChatBot {
     this.protocolReady = false;
     this.capabilities.clear();
     this.invalidateAll();
+    this.queryTimes = [];
     const socket = this.socket;
     this.socket = undefined;
     if (socket && socket.readyState !== WebSocket.CLOSED) socket.terminate();
@@ -275,23 +293,33 @@ export class ChatBot {
     for (const chatId of this.jobs.keys()) this.cancelChat(chatId);
     this.identities.clear();
     this.engaged.clear();
-    this.ownMessages.clear();
+    this.referenceAuthors.clear();
     for (const request of [...this.pending.values()]) request.reject(failure('cancelled'));
     this.engine.clearAll();
   }
 
   cancelChat(chatId: string): void {
-    for (const job of this.jobs.get(chatId) ?? []) job.abort();
+    const queue = this.jobs.get(chatId);
+    if (queue) {
+      this.jobs.delete(chatId);
+      for (const entry of queue.waiting) this.waiting.delete(entry);
+      this.outstanding -= queue.waiting.length + (queue.active ? 1 : 0);
+      queue.waiting.length = 0;
+      if (queue.active) queue.active.abort();
+    }
+    for (const request of [...this.pending.values()]) {
+      if (request.chatId === chatId) request.reject(failure('cancelled'));
+    }
     this.engine.clear(chatId);
     this.engaged.delete(chatId);
     this.identities.delete(chatId);
   }
 
-  rememberOwn(chatId: string, messageId: unknown): void {
+  rememberAuthor(chatId: string, messageId: unknown, own: boolean): void {
     if (typeof messageId !== 'string' || !messageId) return;
-    this.ownMessages.set(JSON.stringify([chatId, messageId]), chatId);
-    const oldest = this.ownMessages.keys().next();
-    if (this.ownMessages.size > DEDUP_LIMIT && !oldest.done) this.ownMessages.delete(oldest.value);
+    this.referenceAuthors.set(JSON.stringify([chatId, messageId]), { chatId, own });
+    const oldest = this.referenceAuthors.keys().next();
+    if (this.referenceAuthors.size > DEDUP_LIMIT && !oldest.done) this.referenceAuthors.delete(oldest.value);
   }
 
   isDirect(message: LineMessage, ownId: string): boolean {
@@ -306,32 +334,40 @@ export class ChatBot {
       message.text[mention.start] === '@'
     )) return true;
     return typeof message.replyTo === 'string' &&
-      this.ownMessages.has(JSON.stringify([message.channelId, message.replyTo]));
+      this.referenceAuthors.get(JSON.stringify([message.channelId, message.replyTo]))?.own === true;
   }
 
   async isHistoricalReply(message: LineMessage, ownId: string, signal: AbortSignal): Promise<boolean> {
     if (typeof message.replyTo !== 'string' || !message.replyTo) return false;
+    const cached = this.referenceAuthors.get(JSON.stringify([message.channelId, message.replyTo]));
+    if (cached) return cached.own;
     const cursors = new Set<string>();
     let before: string | undefined;
     while (!signal.aborted) {
       const page = await this.request('history:fetch', {
         chatId: message.channelId, limit: 100, ...(before ? { before } : {}),
       }, 'history', signal);
+      if (signal.aborted || !this.ready || (this.channels && !this.channels.has(message.channelId))) return false;
       if (page.type !== 'history' || page.chatId !== message.channelId ||
           !Array.isArray(page.messages) || typeof page.hasMore !== 'boolean') throw failure('invalid_history');
+      for (const entry of page.messages) {
+        if (!isRecord(entry) || entry.channelId !== message.channelId ||
+            typeof entry.messageId !== 'string' || !entry.messageId.trim()) continue;
+        if (entry.unsent) {
+          this.referenceAuthors.delete(JSON.stringify([message.channelId, entry.messageId]));
+        } else if (typeof entry.senderId === 'string' && entry.senderId.trim()) {
+          this.rememberAuthor(message.channelId, entry.messageId, entry.senderId === ownId);
+        }
+      }
       const target: unknown = page.messages.find((entry: unknown) =>
         isRecord(entry) && entry.channelId === message.channelId && entry.messageId === message.replyTo);
       if (isRecord(target)) {
-        if (target.senderId !== ownId || target.unsent) return false;
-        this.rememberOwn(message.channelId, message.replyTo);
-        return true;
+        return typeof target.senderId === 'string' && target.senderId === ownId && !target.unsent;
       }
       if (!page.hasMore) return false;
       if (typeof page.cursor !== 'string' || !page.cursor || cursors.has(page.cursor)) throw failure('invalid_history');
       before = page.cursor;
       cursors.add(before);
-      // LINE.js limits history requests to ten per second per connection.
-      await delay(100, signal);
     }
     return false;
   }
@@ -349,6 +385,7 @@ export class ChatBot {
   }
 
   receive(event: unknown): void {
+    if (this.stopped) return;
     if (!isLineEvent(event)) return;
     if (event.type === 'pong') {
       clearTimeout(this.heartbeatDeadline);
@@ -390,7 +427,7 @@ export class ChatBot {
       if (!pending) return;
       if (event.type === 'error') pending.reject(failure('line_request_failed'));
       else if (event.type === pending.type) {
-        if (event.type === 'sent') this.rememberOwn(pending.chatId, event.messageId);
+        if (event.type === 'sent') this.rememberAuthor(pending.chatId, event.messageId, true);
         pending.resolve(event as ResponseEvent);
       }
       return;
@@ -399,11 +436,12 @@ export class ChatBot {
       const next = new Set(event.channels.flatMap((channel: unknown) =>
         channel !== null && typeof channel === 'object' && 'channelId' in channel &&
         typeof channel.channelId === 'string' ? [channel.channelId] : []));
-      for (const chatId of new Set([...(this.channels ?? []), ...this.jobs.keys(), ...this.engaged, ...this.ownMessages.values()])) {
+      for (const chatId of new Set([...(this.channels ?? []), ...this.jobs.keys(), ...this.engaged,
+        ...Array.from(this.referenceAuthors.values(), author => author.chatId)])) {
         if (!next.has(chatId)) {
           this.cancelChat(chatId);
-          for (const [key, ownChatId] of this.ownMessages) {
-            if (ownChatId === chatId) this.ownMessages.delete(key);
+          for (const [key, author] of this.referenceAuthors) {
+            if (author.chatId === chatId) this.referenceAuthors.delete(key);
           }
         }
       }
@@ -421,16 +459,25 @@ export class ChatBot {
         const messageId = event.type === 'message:edit'
           ? changedMessage && 'messageId' in changedMessage ? changedMessage.messageId : undefined
           : event.messageId;
-        if (event.type === 'message:unsend') this.ownMessages.delete(JSON.stringify([chatId, messageId]));
+        if (event.type === 'message:unsend' || (changedMessage && 'unsent' in changedMessage && changedMessage.unsent)) {
+          this.referenceAuthors.delete(JSON.stringify([chatId, messageId]));
+        }
         this.cancelChat(chatId);
       }
       return;
     }
     if (event.type !== 'message') return;
     const message = event.message;
+    // Withdrawn snapshots may omit text or sender fields.
+    if (isRecord(message) && typeof message.channelId === 'string' && typeof message.messageId === 'string' &&
+        message.unsent && this.allowed.has(message.channelId)) {
+      this.referenceAuthors.delete(JSON.stringify([message.channelId, message.messageId]));
+      this.cancelChat(message.channelId);
+      return;
+    }
     if (!isMessage(message) || !this.allowed.has(message.channelId) || (this.channels && !this.channels.has(message.channelId))) return;
     // LINE.js normalizes text content type 0 to NONE, not TEXT.
-    if (message.contentType !== 'NONE' || typeof message.text !== 'string' || !message.text.trim() || message.unsent || message.decryptFailed) return;
+    if (message.contentType !== 'NONE' || typeof message.text !== 'string' || !message.text.trim() || message.decryptFailed) return;
     if (typeof message.messageId !== 'string' || !message.messageId || typeof message.senderId !== 'string' || !message.senderId) return;
     const key = JSON.stringify([message.channelId, message.messageId]);
     if (this.seen.has(key)) return;
@@ -441,21 +488,63 @@ export class ChatBot {
   }
 
   enqueue(message: LineMessage): void {
+    if (this.stopped || !this.ready) return;
     const chatId = message.channelId;
+    let queue = this.jobs.get(chatId);
+    let victim: WaitingMessage | undefined;
+    const chatCount = queue ? queue.waiting.length + (queue.active ? 1 : 0) : 0;
+    if (chatCount >= this.config.line.maxPendingPerChat) {
+      victim = queue?.waiting[0];
+      if (!victim) {
+        this.log('queue_full');
+        return;
+      }
+    }
+    if (!victim && this.outstanding >= this.config.line.maxPendingTotal) {
+      victim = this.waiting.values().next().value;
+      if (!victim) {
+        this.log('queue_full');
+        return;
+      }
+    }
+    // Choose a viable admission before removing any existing payload.
+    if (victim) {
+      victim.queue.waiting.splice(victim.queue.waiting.indexOf(victim), 1);
+      this.waiting.delete(victim);
+      this.outstanding--;
+      this.log('queue_evicted');
+    }
+    if (!queue) {
+      queue = { chatId, waiting: [] };
+      this.jobs.set(chatId, queue);
+    }
+    const entry = { message, queue };
+    queue.waiting.push(entry);
+    this.waiting.add(entry);
+    this.outstanding++;
+    this.processNext(queue);
+  }
+
+  processNext(queue: MessageQueue): void {
+    if (queue.active || this.jobs.get(queue.chatId) !== queue) return;
+    const entry = queue.waiting.shift();
+    if (!entry) {
+      this.jobs.delete(queue.chatId);
+      return;
+    }
+    this.waiting.delete(entry);
     const controller = new AbortController();
-    let jobs = this.jobs.get(chatId);
-    if (!jobs) this.jobs.set(chatId, jobs = new Set());
-    jobs.add(controller);
-    const previous = this.queues.get(chatId) ?? Promise.resolve();
-    const work = previous.then(() => this.reply(message, controller.signal)).catch((error: unknown) => {
+    queue.active = controller;
+    void this.reply(entry.message, controller.signal).catch((error: unknown) => {
       if (!controller.signal.aborted) this.log(error !== null && typeof error === 'object' &&
         'code' in error && error.code === 'identity_unavailable' ? 'identity_unavailable' : 'reply_failed');
     }).finally(() => {
-      jobs.delete(controller);
-      if (!jobs.size && this.jobs.get(chatId) === jobs) this.jobs.delete(chatId);
-      if (this.queues.get(chatId) === work) this.queues.delete(chatId);
+      queue.active = undefined;
+      // A cancelled owner must not release slots or remove a replacement queue.
+      if (this.jobs.get(queue.chatId) !== queue) return;
+      this.outstanding--;
+      this.processNext(queue);
     });
-    this.queues.set(chatId, work);
   }
 
   async ownId(message: LineMessage, signal: AbortSignal): Promise<string | undefined> {
@@ -481,10 +570,8 @@ export class ChatBot {
     if (signal.aborted || !this.ready) return;
     const ownId = await this.ownId(message, signal);
     if (!ownId || signal.aborted) return;
-    if (message.senderId === ownId) {
-      this.rememberOwn(message.channelId, message.messageId);
-      return;
-    }
+    this.rememberAuthor(message.channelId, message.messageId, message.senderId === ownId);
+    if (message.senderId === ownId) return;
     const direct = this.isDirect(message, ownId) || await this.isHistoricalReply(message, ownId, signal);
     if (signal.aborted) return;
     if (!direct && !this.engaged.has(message.channelId)) return;
@@ -508,6 +595,10 @@ export class ChatBot {
   }
 
   rateLimit(signal: AbortSignal): Promise<void> {
+    if (signal.aborted) return Promise.reject(failure('cancelled'));
+    const { promise, resolve, reject } = Promise.withResolvers<void>();
+    const cancel = () => reject(failure('cancelled'));
+    signal.addEventListener('abort', cancel, { once: true });
     const slot = this.rateQueue.then(async () => {
       if (signal.aborted) throw failure('cancelled');
       // Permit short bursts without exceeding the server's rolling minute budget.
@@ -527,8 +618,15 @@ export class ChatBot {
         break;
       }
     });
-    this.rateQueue = slot.catch(() => {});
-    return slot;
+    // Keep the FIFO chain intact; only the caller's wait ends early on cancellation.
+    this.rateQueue = slot.then(() => {
+      signal.removeEventListener('abort', cancel);
+      resolve();
+    }, error => {
+      signal.removeEventListener('abort', cancel);
+      reject(error);
+    });
+    return promise;
   }
 
   send(event: LineRequest): void {
@@ -544,15 +642,37 @@ export class ChatBot {
   ): Promise<ResponseEvent> {
     if (signal.aborted) return Promise.reject(failure('cancelled'));
     const requestId = randomUUID();
+    const controller = new AbortController();
     return new Promise<ResponseEvent>((resolve, reject) => {
+      let timer: NodeJS.Timeout | undefined;
       const finish = <T>(callback: (value: T) => void, value: T): void => {
+        controller.abort();
         clearTimeout(timer);
         signal.removeEventListener('abort', cancel);
         this.pending.delete(requestId);
         callback(value);
       };
       const cancel = () => finish(reject, failure('cancelled'));
-      const timer = setTimeout(() => finish(reject, failure('line_request_timeout')), REQUEST_TIMEOUT);
+      const upload = async () => {
+        if (type !== 'message:send') {
+          while (!controller.signal.aborted) {
+            const now = Date.now();
+            this.queryTimes = this.queryTimes.filter(time => now - time < 1000);
+            if (this.queryTimes.length < 10) break;
+            await delay(this.queryTimes[0] + 1000 - now, controller.signal);
+          }
+        }
+        if (controller.signal.aborted) return;
+        timer = setTimeout(() => finish(reject, failure('line_request_timeout')), REQUEST_TIMEOUT);
+        try {
+          if (type === 'message:send') this.send({ type, requestId, ...payload });
+          else if (type === 'history:fetch') this.send({ type, requestId, ...payload });
+          else this.send({ type, requestId, ...payload });
+          if (type !== 'message:send') this.queryTimes.push(Date.now());
+        } catch {
+          finish(reject, failure('disconnected'));
+        }
+      };
       this.pending.set(requestId, {
         type: expectedType,
         chatId: payload.chatId,
@@ -560,12 +680,10 @@ export class ChatBot {
         reject: error => finish(reject, error),
       });
       signal.addEventListener('abort', cancel, { once: true });
-      try {
-        if (type === 'message:send') this.send({ type, requestId, ...payload });
-        else if (type === 'history:fetch') this.send({ type, requestId, ...payload });
-        else this.send({ type, requestId, ...payload });
-      } catch {
-        finish(reject, failure('disconnected'));
+      if (type === 'message:send') void upload();
+      else {
+        const slot = this.queryQueue.then(upload);
+        this.queryQueue = slot.catch(() => {});
       }
     });
   }

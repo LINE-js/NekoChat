@@ -66,3 +66,30 @@ test('refuses symlink and group-readable credential files', { skip: process.plat
   await chmod(filename, 0o640);
   await assert.rejects(loadConfig(filename), /chmod 600/);
 });
+
+
+test('queue limits accept inclusive boundaries and reject invalid values or ordering', async t => {
+  const { filename, config, save } = await fixture(t);
+  const line: Record<string, unknown> = config.line;
+  for (const value of [1, 10000]) {
+    line.maxPendingPerChat = value;
+    line.maxPendingTotal = value;
+    await save();
+    const loaded = await loadConfig(filename);
+    assert.equal(loaded.config.line.maxPendingPerChat, value);
+    assert.equal(loaded.config.line.maxPendingTotal, value);
+  }
+  for (const field of ['maxPendingPerChat', 'maxPendingTotal']) {
+    for (const value of [0, -1, 10001, 1.5, '50', null, true]) {
+      line.maxPendingPerChat = 50;
+      line.maxPendingTotal = 200;
+      line[field] = value;
+      await save();
+      await assert.rejects(loadConfig(filename), new RegExp(`line.${field}`));
+    }
+  }
+  line.maxPendingPerChat = 201;
+  line.maxPendingTotal = 200;
+  await save();
+  await assert.rejects(loadConfig(filename), /maxPendingPerChat.*maxPendingTotal/);
+});

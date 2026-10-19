@@ -5,6 +5,9 @@ line:
   ownMemberIds: {}
   textMaxLength: 8000
   sendsPerMinute: 20
+  # 包含處理中的訊息；超限時淘汰最舊的等待訊息，不中斷處理中的工作。
+  maxPendingPerChat: 50
+  maxPendingTotal: 200
 
 claude:
   apiKey: ""

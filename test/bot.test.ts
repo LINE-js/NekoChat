@@ -24,7 +24,7 @@ interface FixtureOptions {
   acknowledge?: boolean;
   history?: (request: Extract<LineRequest, { type: 'history:fetch' }>) => {
     messages: unknown[]; hasMore: boolean; cursor?: string; chatId?: string;
-  };
+  } | null;
 }
 
 function inputJson(input: string): Record<string, unknown> & { text: string } {
@@ -101,8 +101,8 @@ async function fixture(t: TestContext, { prepare, line = {}, handshake = true, a
         socket.send(JSON.stringify({ type: 'sent', requestId: event.requestId, messageId: `sent-${requests.length}` }));
       }
       if (event.type === 'history:fetch') {
-        const page = history?.(event) ?? { messages: [], hasMore: false };
-        socket.send(JSON.stringify({ type: 'history', requestId: event.requestId, chatId: event.chatId, ...page }));
+        const page = history ? history(event) : { messages: [], hasMore: false };
+        if (page) socket.send(JSON.stringify({ type: 'history', requestId: event.requestId, chatId: event.chatId, ...page }));
       }
       if (event.type === 'ping') socket.send(JSON.stringify({ type: 'pong' }));
     });
@@ -113,7 +113,7 @@ async function fixture(t: TestContext, { prepare, line = {}, handshake = true, a
   const bot = new ChatBot({ config: { line: {
     url: `ws://127.0.0.1:${address.port}/api/ws`, token: 'local-test-token',
     chats: ['group', 'second', 'square'], ownMemberIds: {}, textMaxLength: 8000,
-    sendsPerMinute: 240, ...line,
+    sendsPerMinute: 240, maxPendingPerChat: 50, maxPendingTotal: 200, ...line,
   } }, engine, log: code => logs.push(code) });
   t.after(async () => {
     bot.stop();
@@ -331,7 +331,7 @@ test('initial connection refusal retries after ten seconds', async t => {
   await new Promise<void>((resolve, reject) => reservation.close(error => error ? reject(error) : resolve()));
   const logs: string[] = [];
   const bot = new ChatBot({
-    config: { line: { url: `ws://127.0.0.1:${port}/api/ws`, token: 'test', chats: [], ownMemberIds: {}, textMaxLength: 8000, sendsPerMinute: 240 } },
+    config: { line: { url: `ws://127.0.0.1:${port}/api/ws`, token: 'test', chats: [], ownMemberIds: {}, textMaxLength: 8000, sendsPerMinute: 240, maxPendingPerChat: 50, maxPendingTotal: 200 } },
     engine: { async prepare() { return null; }, clearAll() {}, clear() {} }, log: code => logs.push(code),
   });
   t.after(() => bot.stop());
@@ -471,7 +471,7 @@ for (const change of ['edit', 'unsend', 'removed', 'logout', 'account-switch', '
     if (change === 'disconnect') f.socket.close();
     await until(() => f.bot.engaged.size === 0);
     if (['logout', 'account-switch', 'disconnect', 'removed'].includes(change)) {
-      assert.equal(f.bot.ownMessages.size, 0);
+      assert.equal(f.bot.referenceAuthors.size, 0);
       assert.equal(f.bot.identities.size, 0);
     }
     if (change !== 'disconnect') {
@@ -492,7 +492,7 @@ test('partial multipart failure remembers acknowledged ids without engaging the 
   f.send({ type: 'sent', requestId: f.sends[0].requestId, messageId: 'partial-answer' });
   await until(() => f.sends.length === 2);
   assert.equal(f.bot.engaged.size, 0);
-  assert.ok(f.bot.ownMessages.has(JSON.stringify(['group', 'partial-answer'])));
+  assert.ok(f.bot.referenceAuthors.has(JSON.stringify(['group', 'partial-answer'])));
   f.send({ type: 'error', requestId: f.sends[1].requestId });
   await until(() => f.bot.jobs.size === 0);
   assert.equal(f.calls.length, 1);
@@ -503,7 +503,7 @@ test('partial multipart failure remembers acknowledged ids without engaging the 
 test('replying to an edited bot message still directly addresses the bot', async t => {
   const f = await fixture(t);
   f.send(message('own', { senderId: 'self' }));
-  await until(() => f.bot.ownMessages.size === 1);
+  await until(() => f.bot.referenceAuthors.size === 1);
   f.send({ type: 'message:edit', message: message('own', { senderId: 'self' }).message });
   f.send(message('reply-edited', { mentions: [], replyTo: 'own' }));
   await until(() => f.commits.length === 1);
@@ -552,7 +552,6 @@ test('history cancellation cannot restore a withdrawn target or send a reply', a
   f.send(message('reply-old', { mentions: [], replyTo: 'old' }));
   await until(() => f.bot.seen.size === 1 && f.bot.jobs.size === 0);
   assert.equal(f.calls.length, 0);
-  assert.equal(f.bot.ownMessages.size, 0);
   assert.equal(f.sends.length, 0);
 });
 
@@ -618,3 +617,497 @@ test('cancelling a reply waiting for minute budget never sends it later', async 
   await ioUntil(() => f.commits.length === 2);
   assert.deepEqual(f.sends.map(frame => frame.replyTo), ['first', 'replacement']);
 });
+
+test('history and admin queries share a rolling connection-wide budget and skip cancelled waiters', async t => {
+  const f = await fixture(t);
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
+  const signal = new AbortController().signal;
+  const times: number[] = [];
+  f.socket.on('message', data => {
+    const request = requestFrame(data);
+    if (request.type === 'history:fetch' || request.type === 'chat:admins:get') times.push(Date.now());
+    if (request.type === 'chat:admins:get') {
+      f.send({ type: 'chat:admins', requestId: request.requestId, chatId: request.chatId, ownMemberId: 'square-self' });
+    }
+  });
+  const first = Array.from({ length: 9 }, (_, index) =>
+    f.bot.request('history:fetch', { chatId: index % 2 ? 'group' : 'second', limit: 100 }, 'history', signal));
+  first.push(f.bot.request('chat:admins:get', { chatId: 'square' }, 'chat:admins', signal));
+  await Promise.all(first);
+  assert.equal(times.length, 10);
+  const cancelled = new AbortController();
+  const waiting = f.bot.request('history:fetch', { chatId: 'group', limit: 100 }, 'history', cancelled.signal);
+  const rejected = assert.rejects(waiting, { message: 'cancelled' });
+  const next = f.bot.request('chat:admins:get', { chatId: 'second' }, 'chat:admins', signal);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  cancelled.abort();
+  await rejected;
+  await new Promise<void>(resolve => setImmediate(resolve));
+  t.mock.timers.tick(999);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(times.length, 10);
+  t.mock.timers.tick(1);
+  await next;
+  assert.equal(times.length, 11);
+  assert.equal(times[10] - times[0], 1000);
+  assert.equal(f.requests.filter(request => request.type === 'history:fetch').length, 9);
+});
+
+test('query response timeout starts only after the queued request uploads', async t => {
+  const f = await fixture(t);
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
+  const signal = new AbortController().signal;
+  await Promise.all(Array.from({ length: 10 }, () =>
+    f.bot.request('history:fetch', { chatId: 'group', limit: 100 }, 'history', signal)));
+  const queued = f.bot.request('history:fetch', { chatId: 'second', limit: 100 }, 'history', signal);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  t.mock.timers.tick(15_001);
+  const page = await queued;
+  assert.equal(page.type, 'history');
+  assert.equal(f.requests.filter(request => request.type === 'history:fetch').length, 11);
+});
+
+for (const change of ['logout', 'account-switch', 'removed', 'disconnect', 'stop']) {
+  test(`${change} cancels queued queries before they can upload`, async t => {
+    const f = await fixture(t);
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
+    const signal = new AbortController().signal;
+    await Promise.all(Array.from({ length: 10 }, () =>
+      f.bot.request('history:fetch', { chatId: 'group', limit: 100 }, 'history', signal)));
+    f.send(message('queued-history', { mentions: [], replyTo: 'old' }));
+    await ioUntil(() => f.bot.pending.size === 1);
+    if (change === 'logout') f.send({ type: 'auth:state', state: 'idle' });
+    if (change === 'account-switch') f.send({ type: 'auth:ready', profile: { userId: 'new-self' } });
+    if (change === 'removed') f.send({ type: 'channels', channels: [] });
+    if (change === 'disconnect') f.socket.close();
+    if (change === 'stop') f.bot.stop();
+    await ioUntil(() => f.bot.jobs.size === 0);
+    t.mock.timers.tick(1000);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(f.requests.filter(request => request.type === 'history:fetch').length, 10);
+    assert.equal(f.calls.length, 0);
+  });
+}
+
+test('confirmed other authors are reused, isolated by chat, and preserved by edits', async t => {
+  const f = await fixture(t, { prepare: () => null, history: request => ({
+    messages: [message('target', { channelId: request.chatId, senderId: request.chatId === 'second' ? 'self' : 'other' }).message],
+    hasMore: false,
+  }) });
+  const lookup = async (id: string, chatId = 'group') => {
+    f.send(message(id, { channelId: chatId, mentions: [], replyTo: 'target' }));
+    await ioUntil(() => f.bot.seen.has(JSON.stringify([chatId, id])) && f.bot.jobs.size === 0);
+  };
+  await lookup('first');
+  await lookup('repeat');
+  f.send({ type: 'message:edit', message: message('target', { senderId: 'self' }).message });
+  await lookup('after-edit');
+  assert.equal(f.requests.filter(request => request.type === 'history:fetch').length, 1);
+  assert.equal(f.calls.length, 0);
+  await lookup('isolated', 'second');
+  assert.equal(f.requests.filter(request => request.type === 'history:fetch').length, 2);
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls[0].chatId, 'second');
+});
+
+for (const initial of ['missing', 'malformed', 'failed', 'unsent']) {
+  test(`${initial} history targets can be queried again rather than becoming negative cache entries`, async t => {
+    let attempts = 0;
+    const f = await fixture(t, { prepare: () => null, history: request => {
+      attempts++;
+      if (attempts === 1) {
+        if (initial === 'missing') return { messages: [], hasMore: false };
+        if (initial === 'failed') {
+          f.send({ type: 'error', requestId: request.requestId });
+          return null;
+        }
+        return { messages: [{
+          ...message('target', { senderId: 'self' }).message,
+          ...(initial === 'malformed' ? { senderId: null } : { unsent: true }),
+        }], hasMore: false };
+      }
+      return { messages: [message('target', { senderId: 'self' }).message], hasMore: false };
+    } });
+    f.send(message('first', { mentions: [], replyTo: 'target' }));
+    await ioUntil(() => f.bot.seen.size === 1 && f.bot.jobs.size === 0);
+    assert.equal(f.calls.length, 0);
+    f.send(message('retry', { mentions: [], replyTo: 'target' }));
+    await ioUntil(() => f.bot.seen.size === 2 && f.bot.jobs.size === 0);
+    assert.equal(attempts, 2);
+    assert.equal(f.calls.length, 1);
+  });
+}
+
+for (const change of ['unsend', 'unsent-message', 'unsent-edit', 'removed', 'logout', 'account-switch', 'disconnect']) {
+  test(`${change} invalidates confirmed other authors`, async t => {
+    let senderId = 'other';
+    const f = await fixture(t, { prepare: () => null, history: () => ({
+      messages: [message('target', { senderId }).message], hasMore: false,
+    }) });
+    f.send(message('first', { mentions: [], replyTo: 'target' }));
+    await ioUntil(() => f.bot.seen.size === 1 && f.bot.jobs.size === 0);
+    if (change === 'unsend') f.send({ type: 'message:unsend', chatId: 'group', messageId: 'target' });
+    if (change === 'unsent-message') f.send(message('target', { unsent: true }));
+    if (change === 'unsent-edit') f.send({ type: 'message:edit', message: message('target', { unsent: true }).message });
+    if (change === 'removed') f.send({ type: 'channels', channels: [] });
+    if (change === 'logout') f.send({ type: 'auth:state', state: 'idle' });
+    if (change === 'account-switch') f.send({ type: 'auth:ready', profile: { userId: 'new-self' } });
+    if (change === 'disconnect') f.socket.close();
+    if (change === 'disconnect') {
+      await ioUntil(() => !f.bot.ready);
+      return;
+    }
+    senderId = change === 'account-switch' ? 'new-self' : 'self';
+    if (change === 'logout') f.send({ type: 'auth:ready', profile: { userId: 'self' } });
+    if (change === 'removed') f.send({ type: 'channels', channels: [{ channelId: 'group' }] });
+    f.send(message('after-change', { mentions: [], replyTo: 'target' }));
+    await ioUntil(() => f.bot.seen.size === 2 && f.bot.jobs.size === 0);
+    assert.equal(f.requests.filter(request => request.type === 'history:fetch').length, 2);
+    assert.equal(f.calls.length, 1);
+  });
+}
+
+test('reference author cache evicts oldest entries without losing recent self recognition', async t => {
+  const f = await fixture(t, { prepare: () => null });
+  for (let index = 0; index <= 10_000; index++) {
+    f.bot.receive(message(`own-${index}`, { senderId: 'self' }));
+    await ioUntil(() => f.bot.jobs.size === 0);
+  }
+  await ioUntil(() => f.bot.jobs.size === 0);
+  f.send(message('recent-reference', { mentions: [], replyTo: 'own-10000' }));
+  await ioUntil(() => f.calls.length === 1 && f.bot.jobs.size === 0);
+  assert.equal(f.requests.filter(request => request.type === 'history:fetch').length, 0);
+  f.send(message('evicted-reference', { mentions: [], replyTo: 'own-0' }));
+  await ioUntil(() => f.bot.seen.has(JSON.stringify(['group', 'evicted-reference'])) && f.bot.jobs.size === 0);
+  assert.equal(f.requests.filter(request => request.type === 'history:fetch').length, 1);
+  assert.equal(f.calls.length, 1);
+});
+
+for (const change of ['unsend', 'removed', 'logout', 'account-switch']) {
+  test(`${change} prevents an in-flight other-author response restoring the cache`, async t => {
+    const f = await fixture(t, { history: () => {
+      if (change === 'unsend') f.send({ type: 'message:unsend', chatId: 'group', messageId: 'target' });
+      if (change === 'removed') f.send({ type: 'channels', channels: [] });
+      if (change === 'logout') f.send({ type: 'auth:state', state: 'idle' });
+      if (change === 'account-switch') f.send({ type: 'auth:ready', profile: { userId: 'new-self' } });
+      return { messages: [message('target').message], hasMore: false };
+    } });
+    f.send(message('in-flight', { mentions: [], replyTo: 'target' }));
+    await ioUntil(() => f.bot.seen.size === 1 && f.bot.jobs.size === 0);
+    if (change === 'logout') f.send({ type: 'auth:ready', profile: { userId: 'self' } });
+    if (change === 'removed') f.send({ type: 'channels', channels: [{ channelId: 'group' }] });
+    f.send(message('retry-after-cancel', { mentions: [], replyTo: 'target' }));
+    await ioUntil(() => f.bot.seen.size === 2 && f.bot.jobs.size === 0);
+    assert.equal(f.requests.filter(request => request.type === 'history:fetch').length, 2);
+    assert.equal(f.calls.length, 0);
+  });
+}
+
+test('withdrawn snapshots without sender or text invalidate confirmed reference authors', async t => {
+  const f = await fixture(t, { prepare: () => null, history: () => ({
+    messages: [message('target').message], hasMore: false,
+  }) });
+  f.send(message('first', { mentions: [], replyTo: 'target' }));
+  await ioUntil(() => f.bot.seen.size === 1 && f.bot.jobs.size === 0);
+  f.send({ type: 'message', message: { channelId: 'group', messageId: 'target', unsent: true } });
+  f.send(message('second', { mentions: [], replyTo: 'target' }));
+  await ioUntil(() => f.bot.seen.size === 2 && f.bot.jobs.size === 0);
+  assert.equal(f.requests.filter(request => request.type === 'history:fetch').length, 2);
+  assert.equal(f.calls.length, 0);
+});
+
+test('cancelling a middle send waiter releases its chat without bypassing FIFO or consuming budget', async t => {
+  const f = await fixture(t, { line: { sendsPerMinute: 1 } });
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
+  f.send(message('prime'));
+  await ioUntil(() => f.commits.length === 1);
+  f.send(message('head'));
+  await ioUntil(() => f.calls.length === 2);
+  f.send(message('middle', { channelId: 'second' }));
+  await ioUntil(() => f.calls.length === 3);
+  f.send({ type: 'message:unsend', chatId: 'second', messageId: 'middle' });
+  await ioUntil(() => f.calls[2].signal.aborted && !f.bot.jobs.has('second'));
+  f.send(message('replacement', { channelId: 'second' }));
+  await ioUntil(() => f.calls.length === 4);
+  assert.deepEqual(f.sends.map(frame => frame.replyTo), ['prime']);
+  t.mock.timers.tick(59_999);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(f.sends.length, 1);
+  t.mock.timers.tick(1);
+  await ioUntil(() => f.commits.length === 2);
+  assert.deepEqual(f.sends.map(frame => frame.replyTo), ['prime', 'head']);
+  t.mock.timers.tick(60_000);
+  await ioUntil(() => f.commits.length === 3);
+  assert.deepEqual(f.sends.map(frame => frame.replyTo), ['prime', 'head', 'replacement']);
+});
+
+for (const channelKind of ['group', 'square']) {
+  test(`live ${channelKind} author observations avoid history queries and expire on withdrawal`, async t => {
+    const f = await fixture(t, { prepare: () => null,
+      line: { ownMemberIds: { square: 'square-self' } },
+      history: request => ({
+        messages: [message('observed', { channelId: request.chatId,
+          senderId: channelKind === 'square' ? 'square-self' : 'self' }).message],
+        hasMore: false,
+      }),
+    });
+    const channelId = channelKind === 'square' ? 'square' : 'group';
+    f.send(message('observed', { channelId, channelKind, mentions: [] }));
+    f.send(message('quote-live', { channelId, channelKind, mentions: [], replyTo: 'observed' }));
+    await ioUntil(() => f.bot.seen.size === 2 && f.bot.jobs.size === 0);
+    assert.equal(f.requests.filter(request => request.type === 'history:fetch').length, 0);
+    assert.equal(f.calls.length, 0);
+    f.send({ type: 'message:unsend', chatId: channelId, messageId: 'observed' });
+    f.send(message('quote-after-unsend', { channelId, channelKind, mentions: [], replyTo: 'observed' }));
+    await ioUntil(() => f.bot.seen.size === 3 && f.bot.jobs.size === 0);
+    assert.equal(f.requests.filter(request => request.type === 'history:fetch').length, 1);
+    assert.equal(f.calls.length, 1);
+    assert.equal(f.calls[0].options.followup, false);
+  });
+}
+
+test('history pages retain valid other and self authors without replaying or caching invalid entries', async t => {
+  const f = await fixture(t, { prepare: () => null, history: () => ({
+    messages: [
+      message('target').message,
+      message('page-other').message,
+      message('page-self', { senderId: 'self' }).message,
+      message('withdrawn', { senderId: 'self', unsent: true }).message,
+      message('foreign', { channelId: 'second', senderId: 'self' }).message,
+      { ...message('malformed').message, senderId: null },
+    ],
+    hasMore: false,
+  }) });
+  f.send(message('first-quote', { mentions: [], replyTo: 'target' }));
+  await ioUntil(() => f.bot.seen.size === 1 && f.bot.jobs.size === 0);
+  assert.equal(f.calls.length, 0);
+  f.send(message('other-quote', { mentions: [], replyTo: 'page-other' }));
+  f.send(message('self-quote', { mentions: [], replyTo: 'page-self' }));
+  await ioUntil(() => f.bot.seen.size === 3 && f.bot.jobs.size === 0);
+  assert.equal(f.requests.filter(request => request.type === 'history:fetch').length, 1);
+  assert.equal(f.calls.length, 1);
+  assert.equal(inputJson(f.calls[0].input).text, '@self-quote');
+  assert.equal(f.calls[0].options.followup, false);
+  for (const replyTo of ['withdrawn', 'foreign', 'malformed']) {
+    f.send(message(`quote-${replyTo}`, { mentions: [], replyTo }));
+  }
+  await ioUntil(() => f.bot.seen.size === 6 && f.bot.jobs.size === 0);
+  assert.equal(f.requests.filter(request => request.type === 'history:fetch').length, 4);
+  assert.equal(f.calls.length, 1);
+});
+
+test('chat overflow evicts oldest waiting payload, preserves FIFO, and deduplicates eviction', async t => {
+  let release: () => void = () => {};
+  const f = await fixture(t, {
+    line: { maxPendingPerChat: 3, maxPendingTotal: 4 },
+    prepare: call => inputJson(call.input).text === '@active'
+      ? new Promise<null>(resolve => { release = () => resolve(null); }) : null,
+  });
+  f.bot.receive(message('active'));
+  await ioUntil(() => f.calls.length === 1);
+  const signal = f.calls[0].signal;
+  for (const id of ['oldest', 'survivor', 'newest']) f.bot.receive(message(id));
+  assert.equal(f.bot.outstanding, 3);
+  assert.equal(signal.aborted, false);
+  assert.deepEqual([...f.bot.waiting].map(entry => entry.message.messageId), ['survivor', 'newest']);
+  assert.deepEqual(f.bot.jobs.get('group')?.waiting.map(entry => entry.message.messageId), ['survivor', 'newest']);
+  f.bot.receive(message('oldest'));
+  assert.equal(f.logs.filter(code => code === 'queue_evicted').length, 1);
+  release();
+  await ioUntil(() => f.bot.jobs.size === 0);
+  assert.deepEqual(f.calls.map(call => inputJson(call.input).text), ['@active', '@survivor', '@newest']);
+  assert.equal(f.bot.outstanding, 0);
+  assert.equal(f.bot.waiting.size, 0);
+  assert.equal(f.requests.length, 0);
+});
+
+test('global overflow selects oldest waiting across chats without evicting active work', async t => {
+  const releases: (() => void)[] = [];
+  const f = await fixture(t, {
+    line: { maxPendingPerChat: 3, maxPendingTotal: 4 },
+    prepare: call => inputJson(call.input).text.startsWith('@active')
+      ? new Promise<null>(resolve => { releases.push(() => resolve(null)); }) : null,
+  });
+  f.bot.receive(message('active-a'));
+  f.bot.receive(message('active-b', { channelId: 'second' }));
+  await ioUntil(() => f.calls.length === 2);
+  f.bot.receive(message('oldest-a'));
+  f.bot.receive(message('survivor-b', { channelId: 'second' }));
+  f.bot.receive(message('newest-a'));
+  assert.equal(f.bot.outstanding, 4);
+  assert.deepEqual([...f.bot.waiting].map(entry => entry.message.messageId), ['survivor-b', 'newest-a']);
+  assert.ok(f.calls.every(call => !call.signal.aborted));
+  for (const release of releases) release();
+  await ioUntil(() => f.bot.jobs.size === 0);
+  assert.deepEqual(f.calls.filter(call => call.chatId === 'group').map(call => inputJson(call.input).text), ['@active-a', '@newest-a']);
+  assert.deepEqual(f.calls.filter(call => call.chatId === 'second').map(call => inputJson(call.input).text), ['@active-b', '@survivor-b']);
+  assert.equal(f.logs.filter(code => code === 'queue_evicted').length, 1);
+  assert.equal(f.bot.outstanding, 0);
+});
+
+test('all-active queues reject newest without replay and recover after completion', async t => {
+  let release: () => void = () => {};
+  const f = await fixture(t, {
+    line: { maxPendingPerChat: 1, maxPendingTotal: 1 },
+    prepare: call => inputJson(call.input).text === '@active'
+      ? new Promise<null>(resolve => { release = () => resolve(null); }) : null,
+  });
+  f.bot.receive(message('active'));
+  await ioUntil(() => f.calls.length === 1);
+  f.bot.receive(message('local-rejected'));
+  f.bot.receive(message('global-rejected', { channelId: 'second' }));
+  assert.equal(f.bot.outstanding, 1);
+  assert.equal(f.bot.waiting.size, 0);
+  assert.equal(f.calls[0].signal.aborted, false);
+  assert.deepEqual(f.logs.filter(code => code.startsWith('queue_')), ['queue_full', 'queue_full']);
+  release();
+  await ioUntil(() => f.bot.jobs.size === 0);
+  f.bot.receive(message('local-rejected'));
+  f.bot.receive(message('global-rejected', { channelId: 'second' }));
+  assert.equal(f.bot.jobs.size, 0);
+  f.bot.receive(message('accepted'));
+  await ioUntil(() => f.bot.jobs.size === 0);
+  assert.deepEqual(f.calls.map(call => inputJson(call.input).text), ['@active', '@accepted']);
+});
+
+test('repeated overflow retains only bounded waiting payloads rather than promise tombstones', async t => {
+  let release: () => void = () => {};
+  const f = await fixture(t, {
+    line: { maxPendingPerChat: 3, maxPendingTotal: 3 },
+    prepare: call => inputJson(call.input).text === '@active'
+      ? new Promise<null>(resolve => { release = () => resolve(null); }) : null,
+  });
+  f.bot.receive(message('active'));
+  await ioUntil(() => f.calls.length === 1);
+  for (let index = 0; index < 1000; index++) f.bot.receive(message(`waiting-${index}`));
+  assert.equal(f.bot.outstanding, 3);
+  assert.equal(f.bot.waiting.size, 2);
+  assert.equal(f.bot.jobs.get('group')?.waiting.length, 2);
+  assert.deepEqual([...f.bot.waiting].map(entry => entry.message.messageId), ['waiting-998', 'waiting-999']);
+  release();
+  await ioUntil(() => f.bot.jobs.size === 0);
+  assert.deepEqual(f.calls.map(call => inputJson(call.input).text), ['@active', '@waiting-998', '@waiting-999']);
+});
+
+test('generation failures release capacity and continue surviving FIFO work', async t => {
+  let reject: (error: Error) => void = () => {};
+  const f = await fixture(t, {
+    line: { maxPendingPerChat: 2, maxPendingTotal: 2 },
+    prepare: call => inputJson(call.input).text === '@failure'
+      ? new Promise<null>((_resolve, fail) => { reject = fail; }) : null,
+  });
+  f.bot.receive(message('failure'));
+  await ioUntil(() => f.calls.length === 1);
+  f.bot.receive(message('survivor'));
+  reject(new Error('private failure detail'));
+  await ioUntil(() => f.bot.jobs.size === 0);
+  assert.equal(f.bot.outstanding, 0);
+  assert.equal(f.bot.waiting.size, 0);
+  assert.ok(f.logs.includes('reply_failed'));
+  assert.ok(!f.logs.some(code => code.includes('private')));
+  f.bot.receive(message('after-error'));
+  await ioUntil(() => f.bot.jobs.size === 0);
+  assert.deepEqual(f.calls.map(call => inputJson(call.input).text), ['@failure', '@survivor', '@after-error']);
+});
+
+for (const action of ['cancel', 'invalidate', 'stop']) {
+  test(`${action} releases waiting payloads and isolates stale active completion`, async t => {
+    const releases: (() => void)[] = [];
+    const f = await fixture(t, {
+      line: { maxPendingPerChat: 2, maxPendingTotal: 2 },
+      prepare: () => new Promise<null>(resolve => { releases.push(() => resolve(null)); }),
+    });
+    f.bot.receive(message('old-active'));
+    await ioUntil(() => f.calls.length === 1);
+    f.bot.receive(message('old-waiter'));
+    const oldQueue = f.bot.jobs.get('group');
+    assert.ok(oldQueue);
+    if (action === 'cancel') f.bot.cancelChat('group');
+    if (action === 'invalidate') f.bot.invalidateAll();
+    if (action === 'stop') f.bot.stop();
+    assert.equal(f.calls[0].signal.aborted, true);
+    assert.equal(f.bot.outstanding, 0);
+    assert.equal(f.bot.waiting.size, 0);
+    assert.equal(oldQueue.waiting.length, 0);
+    assert.equal(f.bot.jobs.size, 0);
+    if (action !== 'cancel') f.bot.receive({ type: 'auth:ready', profile: { userId: 'self' } });
+    f.bot.receive(message('replacement'));
+    if (action !== 'stop') {
+      await ioUntil(() => f.calls.length === 2);
+      assert.equal(f.bot.outstanding, 1);
+    }
+    releases[0]();
+    await ioUntil(() => oldQueue.active === undefined);
+    if (action === 'stop') {
+      assert.equal(f.bot.ready, false);
+      assert.equal(f.calls.length, 1);
+    } else {
+      assert.equal(f.bot.outstanding, 1);
+      assert.equal(f.bot.jobs.size, 1);
+      assert.equal(f.calls[1].signal.aborted, false);
+      releases[1]();
+      await ioUntil(() => f.bot.jobs.size === 0);
+    }
+    assert.equal(f.bot.outstanding, 0);
+  });
+}
+
+test('chat overflow takes priority over an older global waiter when both caps are full', async t => {
+  const releases: (() => void)[] = [];
+  const f = await fixture(t, {
+    line: { maxPendingPerChat: 3, maxPendingTotal: 5 },
+    prepare: call => inputJson(call.input).text.startsWith('@active')
+      ? new Promise<null>(resolve => { releases.push(() => resolve(null)); }) : null,
+  });
+  f.bot.receive(message('active-a'));
+  f.bot.receive(message('active-b', { channelId: 'second' }));
+  await ioUntil(() => f.calls.length === 2);
+  f.bot.receive(message('older-global', { channelId: 'second' }));
+  f.bot.receive(message('oldest-local'));
+  f.bot.receive(message('local-survivor'));
+  f.bot.receive(message('newest-local'));
+  assert.equal(f.bot.outstanding, 5);
+  assert.deepEqual([...f.bot.waiting].map(entry => entry.message.messageId),
+    ['older-global', 'local-survivor', 'newest-local']);
+  assert.equal(f.logs.filter(code => code === 'queue_evicted').length, 1);
+  for (const release of releases) release();
+  await ioUntil(() => f.bot.jobs.size === 0);
+  assert.deepEqual(f.calls.filter(call => call.chatId === 'group').map(call => inputJson(call.input).text),
+    ['@active-a', '@local-survivor', '@newest-local']);
+  assert.deepEqual(f.calls.filter(call => call.chatId === 'second').map(call => inputJson(call.input).text),
+    ['@active-b', '@older-global']);
+});
+
+for (const phase of ['identity', 'history', 'acknowledgement']) {
+  test(`overflow never evicts active ${phase} work or starts evicted messages`, async t => {
+    const f = await fixture(t, {
+      line: { maxPendingPerChat: 2, maxPendingTotal: 2 },
+      history: () => null,
+      acknowledge: false,
+    });
+    const overrides: Partial<LineMessage> = phase === 'identity'
+      ? { channelId: 'square', channelKind: 'square' }
+      : phase === 'history' ? { mentions: [], replyTo: 'unknown-reference' } : {};
+    f.bot.receive(message('active', overrides));
+    const requestType = phase === 'identity' ? 'chat:admins:get'
+      : phase === 'history' ? 'history:fetch' : 'message:send';
+    await ioUntil(() => f.requests.some(request => request.type === requestType));
+    const queue = f.bot.jobs.get(overrides.channelId ?? 'group');
+    assert.ok(queue?.active);
+    const controller = queue.active;
+    f.bot.receive(message('evicted', overrides));
+    f.bot.receive(message('survivor', overrides));
+    assert.equal(controller.signal.aborted, false);
+    assert.equal(f.bot.outstanding, 2);
+    assert.deepEqual(queue.waiting.map(entry => entry.message.messageId), ['survivor']);
+    const requestCount = f.requests.length;
+    // Cancellation releases both slots without allowing the evicted payload to do any work.
+    f.bot.cancelChat(queue.chatId);
+    await ioUntil(() => queue.active === undefined);
+    assert.equal(f.bot.outstanding, 0);
+    assert.equal(f.bot.waiting.size, 0);
+    assert.equal(f.requests.length, requestCount);
+    assert.deepEqual(f.calls.map(call => inputJson(call.input).text),
+      phase === 'acknowledgement' ? ['@active'] : []);
+  });
+}
