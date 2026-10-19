@@ -54,6 +54,7 @@ npm ci --include=dev --ignore-scripts
 - 後續判斷與回答在同一次模型生成完成，內部決策資料不傳送到 LINE。只是相同話題、其他成員彼此交談或關聯不明時不接話；判斷屬模型推論，並非保證零誤判。
 - 每輪先呼叫 Anthropic 的 [token 計數 API](https://platform.claude.com/docs/en/api/messages/count_tokens)，確保人格、對話輸入、直接回答或關聯度決策提示與 schema、預留輸出合計不超過 100K tokens。超限時移除最舊的完整問答並重新計數，不裁切人格或最新訊息；只剩最新訊息仍超限便不生成，後續訊息若已無保留對話可判斷則保持安靜。
 - 生成請求啟用 Anthropic [5 分鐘自動 prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)，重用相同人格與歷史前綴的計算，不是快取整份回答，也不省略 token 計數。首次寫入按官方快取寫入費率計價，命中後按較低讀取費率計價；快取可能到期或因直接回答／關聯度判斷的提示與工具不同而失效。快取由 Anthropic 管理，清除本機對話不代表立即刪除上游快取；不保證短對話每輪都更快。
+- 計數與生成的 JSON body 達 4 KiB（按 UTF-8 bytes 計）時，使用 Node.js 非同步 gzip 快速壓縮；只有壓縮後較小才附上 `Content-Encoding: gzip` 傳送，小請求維持原樣。這減少的是上傳 bytes，不減少 token、API 呼叫次數或改變對話內容；壓縮時間包含在每輪逾時內。Anthropic 官方工具亦採用 [API 請求 gzip 壓縮](https://code.claude.com/docs/en/env-vars#variables)；若網路經過 TLS 檢查代理，代理須支援轉送壓縮 body。HTTP 失敗時中止未讀取的回應傳輸，不下載或記錄錯誤正文，也不自動重送。
 - 模型出錯、計數失敗或回答因輸出額度截斷時，不傳送不完整回答，終端機記錄安全錯誤代碼，不輸出金鑰或訊息原文。
 - 長回答分段發送，不拆開 Unicode surrogate pair；所有段落取得 `sent` 確認後，才將完整問答納入上下文。部分發送失敗不回滾已送出的段落，也不自動重送。
 - 已準備好的回答在有額度時可每 250ms 發送一段，不再將每分鐘額度平均攤成固定等待。所有聊天室共用滾動 60 秒總量上限；額度耗盡才等待最早一次發送到期，斷線不會重設這份限流紀錄。等待中被取消的回答不會在稍後自動補送。Claude 生成與 LINE 確認仍需各自的網路時間。
@@ -83,3 +84,5 @@ TypeScript 遷移另以全新隔離副本驗證 `start.sh` 自動安裝（含 `N
 文字類型修正：先前測試錯用 `contentType: "TEXT"`，未能發現真實 LINE 文字會被忽略。現已對齊 `NONE`，回歸涵蓋 `＠語喵`、有效 mention 與後續關聯度判斷；本機 `/api/ws` 搭配模擬 Anthropic 的實際 CLI 驗證確認，顯示名稱不含「語喵」的有效 @ 標記也能觸發回覆。尚未在真實 LINE 群組驗證此修正。
 
 直接觸發修正：68 項測試通過，涵蓋舊引用分頁辨識、作者與聊天室隔離、收回取消，以及無關閒聊後再次提名／標記／引用仍直接回應。實際 CLI 搭配本機 `/api/ws` 與模擬 Anthropic 已驗證上述收發流程；未在真實 LINE 群組或以真實 Claude 驗證本次修改。
+
+API 傳輸優化：71 項測試通過，涵蓋壓縮期間取消／逾時及計數、生成 HTTP 失敗後關閉未完成回應。使用現有人格檔與合成多輪訊息，在本機 HTTP 伺服器透過真正的 `fetch` 驗證 8 次計數／生成請求：body 總量由 200662 bytes 降至 46430 bytes（減少 76.9%，不含 headers／TLS），解壓後的人格、Unicode 訊息、歷史與後續判斷內容一致；另確認小請求維持未壓縮、UTF-8 byte 門檻及 gzip 回應解碼。此比例僅代表該測試資料，不保證實際延遲或壓縮率；本次未呼叫真實 Anthropic 或 LINE。

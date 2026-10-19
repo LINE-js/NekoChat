@@ -1,3 +1,5 @@
+import { promisify } from 'node:util';
+import { constants, gzip } from 'node:zlib';
 import type { ClaudeConfig } from './config.js';
 import { isRecord } from './guards.js';
 
@@ -25,7 +27,7 @@ export interface ChatFetchResponse {
 export interface ChatFetchOptions {
   method: 'POST';
   headers: Record<string, string>;
-  body: string;
+  body: string | Uint8Array<ArrayBuffer>;
   signal: AbortSignal;
 }
 
@@ -54,6 +56,8 @@ function isTextBlock(value: unknown): value is { type: 'text'; text: string } {
 
 const API_ROOT = 'https://api.anthropic.com/v1';
 const MAX_CONTEXT_TOKENS = 100_000;
+const COMPRESS_MIN_BYTES = 4096;
+const compress = promisify(gzip);
 
 const DIRECT_SYSTEM = `
 The application has verified that the latest member message directly replies to you,
@@ -168,14 +172,27 @@ export class ChatEngine implements ChatEngineLike {
       checkAbort();
       let response: ChatFetchResponse | undefined;
       try {
+        const json = JSON.stringify(body);
+        const bytes = Buffer.byteLength(json);
+        let payload: ChatFetchOptions['body'] = json;
+        const headers: Record<string, string> = {
+          'x-api-key': this.#claude.apiKey,
+          'anthropic-version': '2023-06-01',
+          'content-type': 'application/json',
+        };
+        // Avoid blocking other chats or making small/incompressible uploads larger.
+        if (bytes >= COMPRESS_MIN_BYTES) {
+          const compressed = await compress(json, { level: constants.Z_BEST_SPEED });
+          if (compressed.byteLength < bytes) {
+            payload = compressed;
+            headers['content-encoding'] = 'gzip';
+          }
+        }
+        checkAbort();
         response = await this.#fetch(`${API_ROOT}/${endpoint}`, {
           method: 'POST',
-          headers: {
-            'x-api-key': this.#claude.apiKey,
-            'anthropic-version': '2023-06-01',
-            'content-type': 'application/json',
-          },
-          body: JSON.stringify(body),
+          headers,
+          body: payload,
           signal: controller.signal,
         });
         checkAbort();
@@ -184,6 +201,8 @@ export class ChatEngine implements ChatEngineLike {
         checkAbort();
         return result;
       } catch (error) {
+        // Stop unread error bodies instead of leaving transfers alive after failure.
+        controller.abort();
         checkAbort();
         if (error instanceof ChatError) throw error;
         throw new ChatError(failureCode, response?.status);

@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
+import { once } from 'node:events';
+import { gunzipSync } from 'node:zlib';
 import { ChatEngine, ChatError } from '../src/chat.js';
 import type { ChatFetchOptions, ChatMessage } from '../src/chat.js';
 import type { ClaudeConfig } from '../src/config.js';
@@ -63,7 +66,10 @@ function harness({ count = () => 20, generate, config = {} }: HarnessOptions = {
     claude: { ...claude, ...config },
     system: 'Always be a helpful cat.',
     fetchImpl: async (url, options) => {
-      const body = parseRequest(options.body);
+      const json = options.headers['content-encoding'] === 'gzip'
+        ? gunzipSync(options.body).toString('utf8')
+        : typeof options.body === 'string' ? options.body : Buffer.from(options.body).toString('utf8');
+      const body = parseRequest(json);
       const call = { url, options, body };
       calls.push(call);
       if (url.endsWith('/count_tokens')) {
@@ -255,6 +261,61 @@ test('timeout aborts the fetch and returns a safe TIMEOUT error', async () => {
   await assert.rejects(engine.prepare('chat', 'hello'), hasCode('TIMEOUT'));
   assert.ok(fetchSignal);
   assert.equal(fetchSignal.aborted, true);
+});
+
+test('cancellation during compression prevents uploading a cancelled turn', async () => {
+  const { engine, calls } = harness();
+  const controller = new AbortController();
+  const pending = engine.prepare('chat', '中文'.repeat(10_000), controller.signal);
+  controller.abort();
+  await assert.rejects(pending, hasCode('ABORTED'));
+  assert.equal(calls.length, 0);
+  await engine.prepare('chat', 'next');
+  assert.deepEqual(calls.at(-1)?.body.messages, [{ role: 'user', content: 'next' }]);
+});
+
+test('timeout during compression prevents uploading after the turn deadline', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { engine, calls } = harness();
+  const pending = engine.prepare('chat', '中文'.repeat(10_000));
+  t.mock.timers.tick(claude.timeoutMs);
+  await assert.rejects(pending, hasCode('TIMEOUT'));
+  assert.equal(calls.length, 0);
+});
+
+test('HTTP failures stop unfinished response transfers without waiting for their bodies', { timeout: 5_000 }, async (t) => {
+  for (const endpoint of ['count_tokens', 'messages']) {
+    const closed = Promise.withResolvers<void>();
+    const server = createServer(async (request, response) => {
+      for await (const _chunk of request) { /* Drain the upload before responding. */ }
+      if (request.url?.endsWith(`/${endpoint}`)) {
+        response.on('close', closed.resolve);
+        response.writeHead(429, { 'content-type': 'text/plain' });
+        response.write('an unfinished upstream error body');
+      } else {
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ input_tokens: 20 }));
+      }
+    });
+    t.after(() => {
+      server.closeAllConnections();
+      server.close();
+    });
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const address = server.address();
+    assert.ok(address && typeof address === 'object');
+    const engine = new ChatEngine({
+      claude,
+      system: 'cat',
+      fetchImpl: (url, options) => fetch(`http://127.0.0.1:${address.port}${new URL(url).pathname}`, options),
+    });
+    await assert.rejects(
+      engine.prepare('chat', 'hello'),
+      hasCode(endpoint === 'count_tokens' ? 'COUNT_FAILED' : 'GENERATION_FAILED', 429),
+    );
+    await closed.promise;
+  }
 });
 
 test('joins text response blocks without losing their contents', async () => {
