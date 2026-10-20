@@ -500,9 +500,9 @@ export class ChatBot {
     const ownId = message.channelKind === 'square'
       ? this.config.line.ownMemberIds?.[message.channelId] ?? this.identities.get(message.channelId)
       : this.userId;
-    if (typeof ownId === 'string' && message.senderId === ownId) {
-      this.rememberAuthor(message.channelId, message.messageId, true);
-      return;
+    if (typeof ownId === 'string') {
+      this.rememberAuthor(message.channelId, message.messageId, message.senderId === ownId);
+      if (message.senderId === ownId) return;
     }
     this.enqueue(message);
   }

@@ -960,6 +960,30 @@ test('chat overflow evicts oldest waiting payload, preserves FIFO, and deduplica
   assert.equal(f.requests.length, 0);
 });
 
+test('evicted member messages retain only author knowledge for later references', async t => {
+  const gate = Promise.withResolvers<null>();
+  t.after(() => gate.resolve(null));
+  const f = await fixture(t, {
+    line: { maxPendingPerChat: 2, maxPendingTotal: 2 },
+    prepare: call => inputJson(call.input).text === '@active' ? gate.promise : null,
+  });
+  f.send(message('active'));
+  await ioUntil(() => f.calls.length === 1);
+  f.send(message('evicted'));
+  f.send(message('quote', { mentions: [], replyTo: 'evicted' }));
+  await ioUntil(() => f.bot.seen.size === 3);
+  assert.deepEqual([...f.bot.waiting].map(entry => entry.message.messageId), ['quote']);
+  gate.resolve(null);
+  await ioUntil(() => f.bot.jobs.size === 0);
+  assert.deepEqual(f.calls.map(call => inputJson(call.input).text), ['@active']);
+  assert.equal(f.requests.filter(request => request.type === 'history:fetch').length, 0);
+  f.send({ type: 'message:unsend', chatId: 'group', messageId: 'evicted' });
+  f.send(message('quote-after-unsend', { mentions: [], replyTo: 'evicted' }));
+  await ioUntil(() => f.bot.seen.size === 4 && f.bot.jobs.size === 0);
+  assert.equal(f.requests.filter(request => request.type === 'history:fetch').length, 1);
+  assert.equal(f.calls.length, 1);
+});
+
 for (const identity of ['group', 'configured-square', 'discovered-square']) {
   test(`${identity} self echoes never delay or evict waiting member questions`, async t => {
     const square = identity !== 'group';
