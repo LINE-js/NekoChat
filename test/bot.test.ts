@@ -433,6 +433,41 @@ test('mentions of other members in idle chats cannot evict queued questions', as
   assert.ok(f.calls.every(call => !call.options.followup));
 });
 
+test('known other quotes preserve queued questions without hiding direct calls or invalidated authors', async t => {
+  const idleChats = Array.from({ length: 20 }, (_, index) => `idle-${index}`);
+  const gate = Promise.withResolvers<null>();
+  t.after(() => gate.resolve(null));
+  const f = await fixture(t, {
+    line: { chats: ['group', ...idleChats], maxPendingPerChat: 3, maxPendingTotal: 3 },
+    prepare: call => inputJson(call.input).text === '@active' ? gate.promise : null,
+    history: request => ({
+      messages: [message('target', { channelId: request.chatId, senderId: 'self' }).message], hasMore: false,
+    }),
+  });
+  for (const channelId of idleChats) f.send(message('target', { channelId, text: '大家午安', mentions: [] }));
+  await ioUntil(() => f.bot.seen.size === 20 && f.bot.jobs.size === 0);
+  f.send(message('active'));
+  await ioUntil(() => f.calls.length === 1);
+  f.send(message('waiting-a'));
+  f.send(message('waiting-b'));
+  for (const channelId of idleChats) f.send(message('quote-other', { channelId, mentions: [], replyTo: 'target' }));
+  await ioUntil(() => f.bot.seen.size === 43);
+  assert.ok(!f.logs.includes('queue_evicted'));
+  gate.resolve(null);
+  await ioUntil(() => f.bot.jobs.size === 0);
+  assert.deepEqual(f.calls.map(call => inputJson(call.input).text), ['@active', '@waiting-a', '@waiting-b']);
+  f.send(message('named', { channelId: idleChats[1], text: '語喵你好', mentions: [], replyTo: 'target' }));
+  await ioUntil(() => f.calls.length === 4 && f.bot.jobs.size === 0);
+  assert.equal(f.requests.filter(request => request.type === 'history:fetch').length, 0);
+  f.send({ type: 'message:unsend', chatId: idleChats[0], messageId: 'target' });
+  f.send(message('unknown-again', { channelId: idleChats[0], mentions: [], replyTo: 'target' }));
+  await ioUntil(() => f.calls.length === 5 && f.bot.jobs.size === 0);
+  f.send(message('known-self', { channelId: idleChats[0], mentions: [], replyTo: 'target' }));
+  await ioUntil(() => f.calls.length === 6 && f.bot.jobs.size === 0);
+  assert.equal(f.requests.filter(request => request.type === 'history:fetch').length, 1);
+  assert.deepEqual(f.calls.slice(3).map(call => inputJson(call.input).text), ['語喵你好', '@unknown-again', '@known-self']);
+});
+
 test('name and targeted metadata triggers are direct, then followups can respond or skip', async t => {
   let committed = 0;
   const f = await fixture(t, { prepare: ({ input }) => {
