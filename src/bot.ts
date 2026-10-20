@@ -507,9 +507,10 @@ export class ChatBot {
     }
     // Pending work may engage the chat before this message is processed.
     if (!this.engaged.has(message.channelId) && !this.jobs.has(message.channelId) &&
-        !message.text.includes('語喵') &&
-        !(Array.isArray(message.mentions) && message.mentions.length > 0) &&
-        !(typeof message.replyTo === 'string' && message.replyTo)) return;
+        !(typeof message.replyTo === 'string' && message.replyTo) &&
+        !(typeof ownId === 'string'
+          ? this.isDirect(message, ownId)
+          : message.text.includes('語喵') || (Array.isArray(message.mentions) && message.mentions.length > 0))) return;
     this.enqueue(message);
   }
 

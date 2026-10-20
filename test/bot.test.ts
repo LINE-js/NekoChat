@@ -399,6 +399,40 @@ test('idle square chatter leaves shared identity query capacity for an addressed
   assert.equal(f.bot.seen.size, 11);
 });
 
+test('mentions of other members in idle chats cannot evict queued questions', async t => {
+  const idleChats = Array.from({ length: 20 }, (_, index) => `idle-${index}`);
+  const gate = Promise.withResolvers<null>();
+  t.after(() => gate.resolve(null));
+  const f = await fixture(t, {
+    line: {
+      chats: ['group', ...idleChats], maxPendingPerChat: 3, maxPendingTotal: 3,
+      ownMemberIds: Object.fromEntries(idleChats.slice(10).map(chatId => [chatId, 'square-self'])),
+    },
+    prepare: call => inputJson(call.input).text === '@active' ? gate.promise : null,
+  });
+  f.send(message('active'));
+  await ioUntil(() => f.calls.length === 1);
+  f.send(message('waiting-a'));
+  f.send(message('waiting-b'));
+  for (const [index, channelId] of idleChats.entries()) {
+    f.send(message(`noise-${index}`, {
+      channelId, channelKind: index < 10 ? 'group' : 'square', text: '@other 大家在聊天',
+      mentions: [{ userId: 'someone-else', start: 0, end: 6 }],
+    }));
+  }
+  await ioUntil(() => f.bot.seen.size === 23);
+  assert.ok(!f.logs.includes('queue_evicted'));
+  assert.ok(!f.logs.includes('queue_full'));
+  gate.resolve(null);
+  await ioUntil(() => f.bot.jobs.size === 0);
+  assert.deepEqual(f.calls.map(call => inputJson(call.input).text), ['@active', '@waiting-a', '@waiting-b']);
+  f.send(message('to-group', { channelId: idleChats[0] }));
+  f.send(message('to-square', { channelId: idleChats[10], channelKind: 'square' }));
+  await ioUntil(() => f.calls.length === 5 && f.bot.jobs.size === 0);
+  assert.deepEqual(f.calls.slice(3).map(call => call.chatId), [idleChats[0], idleChats[10]]);
+  assert.ok(f.calls.every(call => !call.options.followup));
+});
+
 test('name and targeted metadata triggers are direct, then followups can respond or skip', async t => {
   let committed = 0;
   const f = await fixture(t, { prepare: ({ input }) => {
