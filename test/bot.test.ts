@@ -960,6 +960,46 @@ test('chat overflow evicts oldest waiting payload, preserves FIFO, and deduplica
   assert.equal(f.requests.length, 0);
 });
 
+for (const identity of ['group', 'configured-square', 'discovered-square']) {
+  test(`${identity} self echoes never delay or evict waiting member questions`, async t => {
+    const square = identity !== 'group';
+    const channelId = square ? 'square' : 'group';
+    const senderId = square ? 'square-self' : 'self';
+    const scope = { channelId, channelKind: square ? 'square' : 'group' };
+    const gate = Promise.withResolvers<null>();
+    t.after(() => gate.resolve(null));
+    const f = await fixture(t, {
+      line: {
+        maxPendingPerChat: 3, maxPendingTotal: 3,
+        ownMemberIds: identity === 'configured-square' ? { square: senderId } : {},
+      },
+      prepare: call => inputJson(call.input).text === '@active' ? gate.promise : null,
+    });
+    f.send(message('active', scope));
+    if (identity === 'discovered-square') {
+      await ioUntil(() => f.requests.some(request => request.type === 'chat:admins:get'));
+      const request = f.requests.find(request => request.type === 'chat:admins:get')!;
+      assert.ok('requestId' in request);
+      f.send({ type: 'chat:admins', requestId: request.requestId, chatId: channelId, ownMemberId: senderId });
+    }
+    await ioUntil(() => f.calls.length === 1);
+    for (const id of ['waiting-a', 'waiting-b']) f.send(message(id, scope));
+    for (let index = 0; index < 20; index++) f.send(message(`echo-${index}`, { ...scope, senderId }));
+    await ioUntil(() => f.bot.seen.size === 23);
+    assert.equal(f.bot.outstanding, 3);
+    assert.ok(!f.logs.includes('queue_evicted'));
+    assert.ok(!f.logs.includes('queue_full'));
+    gate.resolve(null);
+    await ioUntil(() => f.bot.jobs.size === 0);
+    assert.deepEqual(f.calls.map(call => inputJson(call.input).text), ['@active', '@waiting-a', '@waiting-b']);
+    f.send(message('quote-echo', { ...scope, mentions: [], replyTo: 'echo-19' }));
+    await ioUntil(() => f.calls.length === 4 && f.bot.jobs.size === 0);
+    assert.equal(f.requests.filter(request => request.type === 'history:fetch').length, 0);
+    assert.equal(f.requests.filter(request => request.type === 'chat:admins:get').length,
+      identity === 'discovered-square' ? 1 : 0);
+  });
+}
+
 test('global overflow selects oldest waiting across chats without evicting active work', async t => {
   const releases: (() => void)[] = [];
   const f = await fixture(t, {

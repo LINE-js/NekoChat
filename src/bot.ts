@@ -152,7 +152,7 @@ export class ChatBot {
   log: (code: string) => void;
   allowed: Set<string>;
   pending: Map<string, PendingRequest>;
-  identities: Map<string, Promise<string>>;
+  identities: Map<string, string | Promise<string>>;
   jobs: Map<string, MessageQueue>;
   waiting: Set<WaitingMessage>;
   outstanding: number;
@@ -497,6 +497,13 @@ export class ChatBot {
     this.seen.set(key, true);
     const oldest = this.seen.keys().next();
     if (this.seen.size > DEDUP_LIMIT && !oldest.done) this.seen.delete(oldest.value);
+    const ownId = message.channelKind === 'square'
+      ? this.config.line.ownMemberIds?.[message.channelId] ?? this.identities.get(message.channelId)
+      : this.userId;
+    if (typeof ownId === 'string' && message.senderId === ownId) {
+      this.rememberAuthor(message.channelId, message.messageId, true);
+      return;
+    }
     this.enqueue(message);
   }
 
@@ -569,6 +576,9 @@ export class ChatBot {
     if (!identity) {
       identity = this.request('chat:admins:get', { chatId: message.channelId }, 'chat:admins', signal).then(event => {
         if (event.type !== 'chat:admins' || event.chatId !== message.channelId || typeof event.ownMemberId !== 'string' || !event.ownMemberId) throw failure('identity_unavailable');
+        if (this.identities.get(message.channelId) === identity) {
+          this.identities.set(message.channelId, event.ownMemberId);
+        }
         return event.ownMemberId;
       });
       this.identities.set(message.channelId, identity);
