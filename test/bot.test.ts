@@ -401,6 +401,21 @@ test('name and targeted metadata triggers are direct, then followups can respond
   assert.equal(f.calls.length, 5);
 });
 
+test('a declined name trigger does not send or engage the chat', async t => {
+  const f = await fixture(t, { prepare: ({ input }) => inputJson(input).text === '語喵，你怎麼看？'
+    ? { text: '我覺得可以先確認需求。', commit: () => {} } : null,
+  });
+  f.send(message('about-bot', { text: '語喵剛剛說了什麼，你知道嗎？', mentions: [] }));
+  f.send(message('ordinary', { text: '我也不知道', mentions: [] }));
+  await until(() => f.bot.seen.size === 2 && f.bot.jobs.size === 0);
+  assert.equal(f.sends.length, 0);
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.bot.engaged.has('group'), false);
+  f.send(message('addressed', { text: '語喵，你怎麼看？', mentions: [] }));
+  await until(() => f.bot.engaged.has('group'));
+  assert.deepEqual(f.sends.map(send => send.replyTo), ['addressed']);
+});
+
 test('queued untriggered followup waits for successful acknowledgement and commit', async t => {
   const f = await fixture(t, { acknowledge: false });
   f.send(message('initial'));

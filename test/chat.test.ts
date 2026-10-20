@@ -6,7 +6,7 @@ import { setImmediate } from 'node:timers/promises';
 import type { Transform, TransformCallback } from 'node:stream';
 import { createGzip, gunzipSync } from 'node:zlib';
 import { ChatEngine, ChatError } from '../src/chat.js';
-import type { ChatFetchOptions, ChatMessage } from '../src/chat.js';
+import type { ChatFetchOptions, ChatMessage, PreparedTurn } from '../src/chat.js';
 import type { ClaudeConfig } from '../src/config.js';
 
 interface RequestBody {
@@ -78,10 +78,8 @@ function harness({ count = () => 20, generate, config = {} }: HarnessOptions = {
         const result = await count(body, calls);
         return result instanceof Response ? result : Response.json({ input_tokens: result });
       }
-      const result = generate ? await generate(body, calls) : {
-        content: [{ type: 'text', text: `answer:${body.messages.at(-1)?.content}` }],
-        stop_reason: 'end_turn',
-      };
+      const result = generate ? await generate(body, calls)
+        : followupResult(true, `answer:${body.messages.at(-1)?.content}`);
       return result instanceof Response ? result : Response.json(result);
     },
   });
@@ -103,10 +101,15 @@ function hasCode(code: string, status?: number) {
   };
 }
 
+function requireTurn(turn: PreparedTurn | null): PreparedTurn {
+  assert.ok(turn);
+  return turn;
+}
+
 test('accepts the exact input plus reserved-output context boundary', async () => {
   const { engine, generations } = harness({ count: () => 90 });
   const turn = await engine.prepare('chat', 'hello');
-  turn.commit();
+  requireTurn(turn).commit();
   assert.equal(generations().length, 1);
   await engine.prepare('chat', 'next');
   assert.equal(generations()[1].body.messages[0].content, 'hello');
@@ -114,8 +117,8 @@ test('accepts the exact input plus reserved-output context boundary', async () =
 
 test('drops only the oldest complete pair and counts the retained request', async () => {
   const { engine, calls, generations } = harness({ count: (body) => body.messages.length * 20 });
-  (await engine.prepare('chat', 'first')).commit();
-  (await engine.prepare('chat', 'second')).commit();
+  requireTurn((await engine.prepare('chat', 'first'))).commit();
+  requireTurn((await engine.prepare('chat', 'second'))).commit();
   const third = await engine.prepare('chat', 'third');
   const expected = [
     { role: 'user', content: 'second' },
@@ -125,7 +128,7 @@ test('drops only the oldest complete pair and counts the retained request', asyn
   assert.deepEqual(generations()[2].body.messages, expected);
   assert.ok(calls.some((call) => call.url.endsWith('/count_tokens') &&
     JSON.stringify(call.body.messages) === JSON.stringify(expected)));
-  third.commit();
+  requireTurn(third).commit();
   await engine.prepare('chat', 'fourth');
   assert.deepEqual(generations()[3].body.messages.map((message) => message.content), [
     'third', 'answer:third', 'fourth',
@@ -138,7 +141,7 @@ test('64-pair overflow drops only turn0 with two count requests', async () => {
       body.messages.length > 127 ? 91 : 90,
   });
   for (let turn = 0; turn < 64; turn++) {
-    (await engine.prepare('chat', `turn${turn}`)).commit();
+    requireTurn((await engine.prepare('chat', `turn${turn}`))).commit();
   }
   calls.length = 0;
   const turn = await engine.prepare('chat', 'turn64');
@@ -151,7 +154,7 @@ test('64-pair overflow drops only turn0 with two count requests', async () => {
   assert.equal(generated.messages.at(-1)?.content, 'turn64');
   assert.deepEqual(generated.messages, counts[1].body.messages);
   assert.equal(generated.system, counts[1].body.system);
-  turn.commit();
+  requireTurn(turn).commit();
   await engine.prepare('chat', 'next');
   assert.equal(generations().at(-1)?.body.messages[0].content, 'turn1');
 });
@@ -165,7 +168,7 @@ test('minimal trimming handles every boundary without counting a candidate twice
           body.messages.length > retainedLength ? 91 : 90,
       });
       for (let turn = 0; turn < pairCount; turn++) {
-        (await engine.prepare('chat', `turn${turn}`)).commit();
+        requireTurn((await engine.prepare('chat', `turn${turn}`))).commit();
       }
       calls.length = 0;
       await engine.prepare('chat', 'next');
@@ -197,7 +200,7 @@ test('failed trimming counts never generate or change committed history', async 
         },
       });
       for (let turn = 0; turn < 4; turn++) {
-        (await engine.prepare('chat', `turn${turn}`)).commit();
+        requireTurn((await engine.prepare('chat', `turn${turn}`))).commit();
       }
       calls.length = 0;
       await assert.rejects(engine.prepare('chat', 'next'), hasCode(
@@ -229,7 +232,7 @@ test('abort and timeout during trimming preserve committed history', async (t) =
         },
       });
       for (let turn = 0; turn < 4; turn++) {
-        (await engine.prepare('chat', `turn${turn}`)).commit();
+        requireTurn((await engine.prepare('chat', `turn${turn}`))).commit();
       }
       calls.length = 0;
       await assert.rejects(engine.prepare('chat', 'next', controller.signal), hasCode(code));
@@ -247,7 +250,7 @@ test('oversized current input is counted intact without repeating trim boundarie
     count: (body) => body.messages.at(-1)?.content === input ? 91 : 20,
   });
   for (const turn of ['first', 'second']) {
-    (await engine.prepare('chat', turn)).commit();
+    requireTurn((await engine.prepare('chat', turn))).commit();
   }
   calls.length = 0;
   await assert.rejects(engine.prepare('chat', input), hasCode('CONTEXT_TOO_LARGE'));
@@ -263,7 +266,7 @@ test('oversized current input is counted intact without repeating trim boundarie
 
 test('can discard all history while preserving the newest input', async () => {
   const { engine, generations } = harness({ count: (body) => body.messages.length === 1 ? 20 : 95 });
-  (await engine.prepare('chat', 'old')).commit();
+  requireTurn((await engine.prepare('chat', 'old'))).commit();
   await engine.prepare('chat', 'new');
   assert.deepEqual(generations()[1].body.messages, [{ role: 'user', content: 'new' }]);
 });
@@ -280,7 +283,7 @@ test('oversized current input still fails after every old pair is removed', asyn
   const { engine, generations } = harness({
     count: (body) => body.messages.at(-1)?.content === 'oversized' ? 91 : 20,
   });
-  (await engine.prepare('chat', 'old')).commit();
+  requireTurn((await engine.prepare('chat', 'old'))).commit();
   await assert.rejects(engine.prepare('chat', 'oversized'), hasCode('CONTEXT_TOO_LARGE'));
   assert.equal(generations().length, 1);
   await engine.prepare('chat', 'small');
@@ -310,7 +313,7 @@ test('network errors cannot leak upstream messages or keys', async () => {
 
 test('history is isolated by chat and uncommitted turns are never included', async () => {
   const { engine, generations } = harness();
-  (await engine.prepare('a', 'committed')).commit();
+  requireTurn((await engine.prepare('a', 'committed'))).commit();
   await engine.prepare('b', 'other');
   await engine.prepare('a', 'uncommitted');
   await engine.prepare('a', 'next');
@@ -324,9 +327,9 @@ test('commit is idempotent and a concurrently prepared stale turn cannot replace
   const { engine, generations } = harness();
   const first = await engine.prepare('chat', 'first');
   const stale = await engine.prepare('chat', 'stale');
-  first.commit();
-  first.commit();
-  stale.commit();
+  requireTurn(first).commit();
+  requireTurn(first).commit();
+  requireTurn(stale).commit();
   await engine.prepare('chat', 'next');
   assert.deepEqual(generations()[2].body.messages.map((message) => message.content), [
     'first', 'answer:first', 'next',
@@ -340,8 +343,8 @@ test('clear and clearAll invalidate outstanding commits even after chat recreati
     if (clearAll) engine.clearAll();
     else engine.clear('chat');
     const fresh = await engine.prepare('chat', 'fresh');
-    pending.commit();
-    fresh.commit();
+    requireTurn(pending).commit();
+    requireTurn(fresh).commit();
     await engine.prepare('chat', 'next');
     assert.deepEqual(generations()[2].body.messages.map((message) => message.content), [
       'fresh', 'answer:fresh', 'next',
@@ -354,7 +357,7 @@ test('aborting after prepare prevents committing a reply that was not sent', asy
   const controller = new AbortController();
   const pending = await engine.prepare('chat', 'cancelled', controller.signal);
   controller.abort();
-  pending.commit();
+  requireTurn(pending).commit();
   await engine.prepare('chat', 'next');
   assert.deepEqual(generations()[1].body.messages, [{ role: 'user', content: 'next' }]);
 });
@@ -521,13 +524,6 @@ test('HTTP failures stop unfinished response transfers without waiting for their
   }
 });
 
-test('joins text response blocks without losing their contents', async () => {
-  const { engine } = harness({ generate: () => ({
-    content: [{ type: 'text', text: 'first' }, { type: 'text', text: 'second' }],
-    stop_reason: 'end_turn',
-  }) });
-  assert.equal((await engine.prepare('chat', 'hello')).text, 'first\nsecond');
-});
 
 test('failed, truncated, blank and nontext output are never retained', async () => {
   const failures = [
@@ -540,9 +536,9 @@ test('failed, truncated, blank and nontext output are never retained', async () 
   ];
   for (const { result, code, status } of failures) {
     let fail = true;
-    const { engine, generations } = harness({ generate: () => fail ? result : {
-      content: [{ type: 'text', text: 'good' }], stop_reason: 'end_turn',
-    } });
+    const { engine, generations } = harness({
+      generate: () => fail ? result : followupResult(true, 'good'),
+    });
     await assert.rejects(engine.prepare('chat', 'failed input'), hasCode(code, status));
     fail = false;
     await engine.prepare('chat', 'next');
@@ -571,29 +567,40 @@ function followupResult(shouldReply: boolean, reply: string) {
 function followupHarness(options: HarnessOptions = {}) {
   return harness({
     ...options,
-    generate: (body, calls) => body.tools
-      ? (options.generate ?? (() => followupResult(true, '自然的回答')))(body, calls)
-      : { content: [{ type: 'text', text: '先前的回答' }], stop_reason: 'end_turn' },
+    generate: (body, calls) => isSeedTurn(body)
+      ? followupResult(true, '先前的回答')
+      : (options.generate ?? (() => followupResult(true, '自然的回答')))(body, calls),
   });
 }
 
-test('unrelated followups return null without contaminating or trimming history', async () => {
-  const { engine, generations } = followupHarness({
-    generate: () => followupResult(false, ''),
-    count: (body) => body.tools && body.messages.length > 3 ? 95 : 20,
+function isSeedTurn(body: RequestBody): boolean {
+  return /^(first|second|direct|turn\d+)$/.test(body.messages.at(-1)?.content ?? '');
+}
+
+for (const followup of [false, true]) {
+  test(`declined replies preserve history (followup=${followup})`, async () => {
+    const { engine, generations } = followupHarness({
+      generate: () => followupResult(false, ''),
+      count: (body) => !isSeedTurn(body) && body.messages.length > 3 ? 95 : 20,
+    });
+    if (!followup) {
+      assert.equal(await engine.prepare('chat', '語喵剛剛說了什麼，你知道嗎？'), null);
+      assert.equal(await engine.prepare('chat', 'ordinary', undefined, { followup: true }), null);
+      assert.equal(generations().length, 1);
+    }
+    requireTurn(await engine.prepare('chat', 'first')).commit();
+    requireTurn(await engine.prepare('chat', 'second')).commit();
+    assert.equal(await engine.prepare('chat', 'unrelated', undefined, { followup }), null);
+    await engine.prepare('chat', 'direct');
+    assert.deepEqual(generations().at(-1)?.body.messages.map((message) => message.content), [
+      'first', '先前的回答', 'second', '先前的回答', 'direct',
+    ]);
   });
-  (await engine.prepare('chat', 'first')).commit();
-  (await engine.prepare('chat', 'second')).commit();
-  assert.equal(await engine.prepare('chat', 'unrelated', undefined, { followup: true }), null);
-  await engine.prepare('chat', 'direct');
-  assert.deepEqual(generations().at(-1)?.body.messages.map((message) => message.content), [
-    'first', '先前的回答', 'second', '先前的回答', 'direct',
-  ]);
-});
+}
 
 test('relevant followups commit only plain reply text and remain transactional', async () => {
   const { engine, generations } = followupHarness();
-  (await engine.prepare('chat', 'first')).commit();
+  requireTurn((await engine.prepare('chat', 'first'))).commit();
   const uncommitted = await engine.prepare('chat', 'not sent', undefined, { followup: true });
   assert.ok(uncommitted);
   assert.equal(uncommitted.text, '自然的回答');
@@ -602,26 +609,24 @@ test('relevant followups commit only plain reply text and remain transactional',
   assert.deepEqual(generations()[2].body.messages.map((message) => message.content), [
     'first', '先前的回答', 'followup',
   ]);
-  turn.commit();
-  turn.commit();
-  uncommitted.commit();
+  requireTurn(turn).commit();
+  requireTurn(turn).commit();
+  requireTurn(uncommitted).commit();
   await engine.prepare('chat', 'direct');
   const direct = generations().at(-1)?.body;
   assert.ok(direct);
   assert.deepEqual(direct.messages.map((message) => message.content), [
     'first', '先前的回答', 'followup', '自然的回答', 'direct',
   ]);
-  assert.equal(direct.tools, undefined);
-  assert.equal(direct.tool_choice, undefined);
 });
 
 test('followups without retained conversational evidence stay silent without generating', async () => {
   const { engine, calls, generations } = followupHarness({
-    count: (body) => body.tools && body.messages.length > 1 ? 95 : 20,
+    count: (body) => !isSeedTurn(body) && body.messages.length > 1 ? 95 : 20,
   });
   assert.equal(await engine.prepare('empty', 'hello', undefined, { followup: true }), null);
   assert.equal(calls.length, 0);
-  (await engine.prepare('chat', 'first')).commit();
+  requireTurn((await engine.prepare('chat', 'first'))).commit();
   assert.equal(await engine.prepare('chat', 'followup', undefined, { followup: true }), null);
   assert.equal(generations().length, 1);
   await engine.prepare('chat', 'direct');
@@ -635,10 +640,10 @@ test('followups without retained conversational evidence stay silent without gen
 test('followup trimming retains minimal evidence or stays silent without changing history', async () => {
   for (const dropped of [1, 2, 4]) {
     const { engine, calls, generations } = followupHarness({
-      count: (body) => body.tools && body.messages.length > (4 - dropped) * 2 + 1 ? 91 : 20,
+      count: (body) => !isSeedTurn(body) && body.messages.length > (4 - dropped) * 2 + 1 ? 91 : 20,
     });
     for (let turn = 0; turn < 4; turn++) {
-      (await engine.prepare('chat', `turn${turn}`)).commit();
+      requireTurn((await engine.prepare('chat', `turn${turn}`))).commit();
     }
     calls.length = 0;
     const turn = await engine.prepare('chat', 'followup', undefined, { followup: true });
@@ -660,7 +665,7 @@ test('followup trimming retains minimal evidence or stays silent without changin
         tools: generated.tools,
         tool_choice: generated.tool_choice,
       })));
-      turn.commit();
+      requireTurn(turn).commit();
     }
     await engine.prepare('chat', 'direct');
     assert.equal(generations().at(-1)?.body.messages[0].content, `turn${dropped === 4 ? 0 : dropped}`);
@@ -670,9 +675,9 @@ test('followup trimming retains minimal evidence or stays silent without changin
 test('followup counts include identical decision system, tools and choice at the 100K boundary', async () => {
   const { engine, calls, generations } = followupHarness({
     config: { contextTokens: 100_000, maxOutputTokens: 1_000 },
-    count: (body) => body.tools ? 99_000 : 20,
+    count: (body) => !isSeedTurn(body) ? 99_000 : 20,
   });
-  (await engine.prepare('chat', 'first')).commit();
+  requireTurn((await engine.prepare('chat', 'first'))).commit();
   await engine.prepare('chat', 'followup', undefined, { followup: true });
   const generated = generations().at(-1)?.body;
   const counted = calls.findLast((call) => call.url.endsWith('/count_tokens'))?.body;
@@ -686,15 +691,15 @@ test('followup counts include identical decision system, tools and choice at the
 test('oversized followup decision overhead never generates and preserves prior history', async () => {
   const { engine, calls, generations } = followupHarness({
     config: { contextTokens: 100_000, maxOutputTokens: 1_000 },
-    count: (body) => body.tools ? 99_001 : 20,
+    count: (body) => !isSeedTurn(body) ? 99_001 : 20,
   });
-  (await engine.prepare('chat', 'first')).commit();
+  requireTurn((await engine.prepare('chat', 'first'))).commit();
   await assert.rejects(
     engine.prepare('chat', 'followup', undefined, { followup: true }),
     hasCode('CONTEXT_TOO_LARGE'),
   );
   assert.equal(generations().length, 1);
-  const counts = calls.filter((call) => call.url.endsWith('/count_tokens') && call.body.tools);
+  const counts = calls.filter((call) => call.url.endsWith('/count_tokens') && !isSeedTurn(call.body));
   assert.deepEqual(counts.map((call) => call.body.messages.length), [3, 1]);
   assert.deepEqual(counts[0].body.tools, counts[1].body.tools);
   assert.deepEqual(counts[0].body.tool_choice, counts[1].body.tool_choice);
@@ -702,7 +707,7 @@ test('oversized followup decision overhead never generates and preserves prior h
   assert.equal(generations().at(-1)?.body.messages[0].content, 'first');
 });
 
-test('malformed followup decisions fail closed and never enter history', async () => {
+test('malformed decisions fail closed and never enter history for either trigger mode', async () => {
   const valid = followupResult(true, 'reply');
   const block = valid.content[0];
   const invalidInputs = [
@@ -724,17 +729,19 @@ test('malformed followup decisions fail closed and never enter history', async (
     { ...valid, content: [{ ...block, name: 'other' }] },
     { ...valid, content: [{ ...block, id: '' }] },
   ];
-  for (const result of failures) {
-    const { engine, generations } = followupHarness({ generate: () => result });
-    (await engine.prepare('chat', 'first')).commit();
-    await assert.rejects(
-      engine.prepare('chat', 'bad followup', undefined, { followup: true }),
-      hasCode('INVALID_RESPONSE'),
-    );
-    await engine.prepare('chat', 'direct');
-    assert.deepEqual(generations().at(-1)?.body.messages.map((message) => message.content), [
-      'first', '先前的回答', 'direct',
-    ]);
+  for (const followup of [false, true]) {
+    for (const result of failures) {
+      const { engine, generations } = followupHarness({ generate: () => result });
+      requireTurn(await engine.prepare('chat', 'first')).commit();
+      await assert.rejects(
+        engine.prepare('chat', 'bad decision', undefined, { followup }),
+        hasCode('INVALID_RESPONSE'),
+      );
+      await engine.prepare('chat', 'direct');
+      assert.deepEqual(generations().at(-1)?.body.messages.map((message) => message.content), [
+        'first', '先前的回答', 'direct',
+      ]);
+    }
   }
 });
 
@@ -742,7 +749,7 @@ test('truncated followup decisions return safe OUTPUT_TRUNCATED errors', async (
   const { engine } = followupHarness({
     generate: () => ({ ...followupResult(true, 'partial'), stop_reason: 'max_tokens' }),
   });
-  (await engine.prepare('chat', 'first')).commit();
+  requireTurn((await engine.prepare('chat', 'first'))).commit();
   await assert.rejects(
     engine.prepare('chat', 'followup', undefined, { followup: true }),
     hasCode('OUTPUT_TRUNCATED'),
@@ -757,7 +764,7 @@ test('followup cancellation before and during generation never commits a decisio
       return followupResult(true, 'must not send');
     },
   });
-  (await engine.prepare('chat', 'first')).commit();
+  requireTurn((await engine.prepare('chat', 'first'))).commit();
   const preAborted = new AbortController();
   preAborted.abort();
   const before = calls.length;
@@ -778,12 +785,12 @@ test('followup cancellation before and during generation never commits a decisio
 
 test('aborting after a followup prepare invalidates its commit', async () => {
   const { engine, generations } = followupHarness();
-  (await engine.prepare('chat', 'first')).commit();
+  requireTurn((await engine.prepare('chat', 'first'))).commit();
   const controller = new AbortController();
   const turn = await engine.prepare('chat', 'followup', controller.signal, { followup: true });
   assert.ok(turn);
   controller.abort();
-  turn.commit();
+  requireTurn(turn).commit();
   await engine.prepare('chat', 'direct');
   assert.deepEqual(generations().at(-1)?.body.messages.map((message) => message.content), [
     'first', '先前的回答', 'direct',
