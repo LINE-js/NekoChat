@@ -11,7 +11,7 @@ import type { ClaudeConfig } from '../src/config.js';
 
 interface RequestBody {
   model: string;
-  system: string;
+  system: { type: 'text'; text: string; cache_control?: { type: 'ephemeral' } }[];
   messages: ChatMessage[];
   tools?: unknown;
   tool_choice?: unknown;
@@ -35,7 +35,17 @@ function parseRequest(body: string): RequestBody {
   const value: unknown = JSON.parse(body);
   assert.ok(value !== null && typeof value === 'object');
   assert.ok('model' in value && typeof value.model === 'string');
-  assert.ok('system' in value && typeof value.system === 'string');
+  assert.ok('system' in value && Array.isArray(value.system));
+  const system: RequestBody['system'] = value.system.map((block: unknown) => {
+    assert.ok(block !== null && typeof block === 'object');
+    assert.ok('type' in block && block.type === 'text');
+    assert.ok('text' in block && typeof block.text === 'string' && block.text.length > 0);
+    return {
+      type: block.type,
+      text: block.text,
+      ...('cache_control' in block ? { cache_control: block.cache_control as { type: 'ephemeral' } } : {}),
+    };
+  });
   assert.ok('messages' in value && Array.isArray(value.messages));
   const messages: ChatMessage[] = value.messages.map((message: unknown) => {
     assert.ok(message !== null && typeof message === 'object');
@@ -45,7 +55,7 @@ function parseRequest(body: string): RequestBody {
   });
   return {
     model: value.model,
-    system: value.system,
+    system,
     messages,
     ...('tools' in value ? { tools: value.tools } : {}),
     ...('tool_choice' in value ? { tool_choice: value.tool_choice } : {}),
@@ -153,7 +163,7 @@ test('64-pair overflow drops only turn0 with two count requests', async () => {
   assert.equal(generated.messages[0].content, 'turn1');
   assert.equal(generated.messages.at(-1)?.content, 'turn64');
   assert.deepEqual(generated.messages, counts[1].body.messages);
-  assert.equal(generated.system, counts[1].body.system);
+  assert.deepEqual(generated.system, counts[1].body.system);
   requireTurn(turn).commit();
   await engine.prepare('chat', 'next');
   assert.equal(generations().at(-1)?.body.messages[0].content, 'turn1');
@@ -183,7 +193,7 @@ test('minimal trimming handles every boundary without counting a candidate twice
         'next',
       ]);
       assert.ok(counts.some(({ body }) =>
-        body.system === generated.system &&
+        JSON.stringify(body.system) === JSON.stringify(generated.system) &&
         JSON.stringify(body.messages) === JSON.stringify(generated.messages)));
     }
   }
@@ -258,7 +268,7 @@ test('oversized current input is counted intact without repeating trim boundarie
   assert.deepEqual(calls.map(({ body }) => body.messages.length), [5, 3, 1]);
   for (const { body } of calls) {
     assert.equal(body.messages.at(-1)?.content, input);
-    assert.equal(body.system, calls[0].body.system);
+    assert.deepEqual(body.system, calls[0].body.system);
   }
   await engine.prepare('chat', 'small');
   assert.equal(generations()[0].body.messages[0].content, 'first');

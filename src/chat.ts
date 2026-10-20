@@ -154,7 +154,7 @@ export class ChatError extends Error {
 
 export class ChatEngine implements ChatEngineLike {
   #claude: ClaudeConfig;
-  #system: string;
+  #system: { type: 'text'; text: string; cache_control: { type: 'ephemeral' } }[];
   #fetch: ChatFetch;
   #chats = new Map<string, ChatState>();
 
@@ -172,7 +172,7 @@ export class ChatEngine implements ChatEngineLike {
       throw new ChatError('INVALID_CONFIG');
     }
     this.#claude = { ...claude };
-    this.#system = system;
+    this.#system = system ? [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }] : [];
     this.#fetch = fetchImpl;
   }
 
@@ -257,7 +257,10 @@ export class ChatEngine implements ChatEngineLike {
       const pairCount = history.length / 2;
       const requestOptions = {
         model: this.#claude.model,
-        system: `${this.#system}\n${followup ? FOLLOWUP_SYSTEM : DIRECT_SYSTEM}\n${DECISION_SYSTEM}`,
+        // Keep the personality cache reusable when the trigger mode or chat changes.
+        system: [...this.#system, {
+          type: 'text', text: `${followup ? FOLLOWUP_SYSTEM : DIRECT_SYSTEM}\n${DECISION_SYSTEM}`,
+        }],
         tools: [REPLY_TOOL], tool_choice: REPLY_CHOICE,
       };
       const messagesAfter = (droppedPairs: number): ChatMessage[] => [...history.slice(droppedPairs * 2), user];
