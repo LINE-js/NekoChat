@@ -798,6 +798,30 @@ test('reference author cache evicts oldest entries without losing recent self re
   assert.equal(f.calls.length, 1);
 });
 
+test('frequently referenced self and other authors survive unrelated cache churn', async t => {
+  const f = await fixture(t, { prepare: () => null });
+  f.bot.rememberAuthor('group', 'hot-self', true);
+  f.bot.rememberAuthor('group', 'hot-other', false);
+  for (let index = 0; index < 9995; index++) {
+    f.bot.rememberAuthor('second', `cold-${index}`, false);
+  }
+  for (const round of ['before', 'after']) {
+    if (round === 'after') {
+      for (let index = 0; index < 5; index++) {
+        f.bot.rememberAuthor('second', `new-${index}`, false);
+      }
+    }
+    for (const target of ['hot-self', 'hot-other']) {
+      const id = `${round}-${target}`;
+      f.send(message(id, { mentions: [], replyTo: target }));
+      await ioUntil(() => f.bot.seen.has(JSON.stringify(['group', id])) && f.bot.jobs.size === 0);
+    }
+  }
+  assert.equal(f.requests.filter(request => request.type === 'history:fetch').length, 0);
+  assert.deepEqual(f.calls.map(call => inputJson(call.input).replyTo), ['hot-self', 'hot-self']);
+  assert.equal(f.bot.referenceAuthors.size, 10_000);
+});
+
 for (const change of ['unsend', 'removed', 'logout', 'account-switch']) {
   test(`${change} prevents an in-flight other-author response restoring the cache`, async t => {
     const f = await fixture(t, { history: () => {

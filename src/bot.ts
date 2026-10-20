@@ -317,9 +317,22 @@ export class ChatBot {
 
   rememberAuthor(chatId: string, messageId: unknown, own: boolean): void {
     if (typeof messageId !== 'string' || !messageId) return;
-    this.referenceAuthors.set(JSON.stringify([chatId, messageId]), { chatId, own });
+    const key = JSON.stringify([chatId, messageId]);
+    this.referenceAuthors.delete(key);
+    this.referenceAuthors.set(key, { chatId, own });
     const oldest = this.referenceAuthors.keys().next();
     if (this.referenceAuthors.size > DEDUP_LIMIT && !oldest.done) this.referenceAuthors.delete(oldest.value);
+  }
+
+  knownAuthor(chatId: string, messageId: string): boolean | undefined {
+    const key = JSON.stringify([chatId, messageId]);
+    const author = this.referenceAuthors.get(key);
+    if (author) {
+      // Active references should survive unrelated traffic in busy chats.
+      this.referenceAuthors.delete(key);
+      this.referenceAuthors.set(key, author);
+    }
+    return author?.own;
   }
 
   isDirect(message: LineMessage, ownId: string): boolean {
@@ -334,13 +347,13 @@ export class ChatBot {
       message.text[mention.start] === '@'
     )) return true;
     return typeof message.replyTo === 'string' &&
-      this.referenceAuthors.get(JSON.stringify([message.channelId, message.replyTo]))?.own === true;
+      this.knownAuthor(message.channelId, message.replyTo) === true;
   }
 
   async isHistoricalReply(message: LineMessage, ownId: string, signal: AbortSignal): Promise<boolean> {
     if (typeof message.replyTo !== 'string' || !message.replyTo) return false;
-    const cached = this.referenceAuthors.get(JSON.stringify([message.channelId, message.replyTo]));
-    if (cached) return cached.own;
+    const cached = this.knownAuthor(message.channelId, message.replyTo);
+    if (cached !== undefined) return cached;
     const cursors = new Set<string>();
     let before: string | undefined;
     while (!signal.aborted) {
