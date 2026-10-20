@@ -320,8 +320,10 @@ export class ChatBot {
     const key = JSON.stringify([chatId, messageId]);
     this.referenceAuthors.delete(key);
     this.referenceAuthors.set(key, { chatId, own });
-    const oldest = this.referenceAuthors.keys().next();
-    if (this.referenceAuthors.size > DEDUP_LIMIT && !oldest.done) this.referenceAuthors.delete(oldest.value);
+    if (this.referenceAuthors.size > DEDUP_LIMIT) {
+      const oldest = this.referenceAuthors.keys().next();
+      if (!oldest.done) this.referenceAuthors.delete(oldest.value);
+    }
   }
 
   knownAuthor(chatId: string, messageId: string): boolean | undefined {
