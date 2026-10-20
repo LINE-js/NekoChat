@@ -504,6 +504,11 @@ export class ChatBot {
       this.rememberAuthor(message.channelId, message.messageId, message.senderId === ownId);
       if (message.senderId === ownId) return;
     }
+    // Pending work may engage the chat before this message is processed.
+    if (!this.engaged.has(message.channelId) && !this.jobs.has(message.channelId) &&
+        !message.text.includes('語喵') &&
+        !(Array.isArray(message.mentions) && message.mentions.length > 0) &&
+        !(typeof message.replyTo === 'string' && message.replyTo)) return;
     this.enqueue(message);
   }
 

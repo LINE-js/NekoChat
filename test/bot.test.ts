@@ -377,6 +377,28 @@ test('unengaged chats ignore ordinary text, invalid mentions, @All and unknown r
   assert.equal(f.sends.length, 0);
 });
 
+test('idle square chatter leaves shared identity query capacity for an addressed chat', async t => {
+  const chats = Array.from({ length: 11 }, (_, index) => `square-${index}`);
+  const f = await fixture(t, { line: { chats }, prepare: () => null });
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
+  f.socket.on('message', data => {
+    const request = requestFrame(data);
+    if (request.type === 'chat:admins:get') {
+      f.send({ type: 'chat:admins', requestId: request.requestId, chatId: request.chatId, ownMemberId: 'square-self' });
+    }
+  });
+  for (const [index, channelId] of chats.entries()) {
+    f.send(message(`idle-${index}`, {
+      channelId, channelKind: 'square', text: index === 10 ? '語喵你好' : '大家午安', mentions: [],
+    }));
+  }
+  await ioUntil(() => f.calls.length === 1 && f.bot.jobs.size === 0);
+  assert.equal(f.calls[0].chatId, chats[10]);
+  assert.deepEqual(f.requests.filter(request => request.type === 'chat:admins:get').map(request => request.chatId),
+    [chats[10]]);
+  assert.equal(f.bot.seen.size, 11);
+});
+
 test('name and targeted metadata triggers are direct, then followups can respond or skip', async t => {
   let committed = 0;
   const f = await fixture(t, { prepare: ({ input }) => {
