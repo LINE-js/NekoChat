@@ -451,12 +451,11 @@ export class ChatBot {
         typeof channel.channelId === 'string' ? [channel.channelId] : []));
       for (const chatId of new Set([...(this.channels ?? []), ...this.jobs.keys(), ...this.engaged,
         ...Array.from(this.referenceAuthors.values(), author => author.chatId)])) {
-        if (!next.has(chatId)) {
-          this.cancelChat(chatId);
-          for (const [key, author] of this.referenceAuthors) {
-            if (author.chatId === chatId) this.referenceAuthors.delete(key);
-          }
-        }
+        if (!next.has(chatId)) this.cancelChat(chatId);
+      }
+      // Purge once rather than rescanning every author for each removed chat.
+      for (const [key, author] of this.referenceAuthors) {
+        if (!next.has(author.chatId)) this.referenceAuthors.delete(key);
       }
       this.channels = next;
       return;
