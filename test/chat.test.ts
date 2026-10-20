@@ -199,6 +199,48 @@ test('minimal trimming handles every boundary without counting a candidate twice
   }
 });
 
+test('measured trim probes preserve the newest fitting history with uneven pair sizes', async () => {
+  for (const weights of [
+    [10, 10, 10, 10, 10, 10, 10, 10],
+    [20, 1, 1, 1, 1, 1, 1, 1],
+    [1, 20, 1, 1, 1, 1, 1, 1],
+    [0, 0, 10, 0, 20, 0, 10, 0],
+  ]) {
+    for (let boundary = 0; boundary <= weights.length; boundary++) {
+      const retainedTokens = weights.slice(boundary).reduce((sum, weight) => sum + weight, 0);
+      const { engine, calls, generations } = harness({
+        count: body => body.messages.at(-1)?.content === 'overflow'
+          ? 90 - retainedTokens + weights.slice(weights.length - (body.messages.length - 1) / 2)
+            .reduce((sum, weight) => sum + weight, 0)
+          : 20,
+      });
+      for (let turn = 0; turn < weights.length; turn++) {
+        requireTurn(await engine.prepare('chat', `turn${turn}`)).commit();
+      }
+      calls.length = 0;
+      const result = await engine.prepare('chat', 'overflow');
+      const firstFit = Array.from({ length: weights.length + 1 }, (_, dropped) => dropped)
+        .find(dropped => weights.slice(dropped).reduce((sum, weight) => sum + weight, 0) <= retainedTokens)!;
+      const expected = [
+        ...weights.slice(firstFit).flatMap((_, index) => [
+          `turn${firstFit + index}`, `answer:turn${firstFit + index}`,
+        ]),
+        'overflow',
+      ];
+      assert.deepEqual(generations()[0].body.messages.map(message => message.content), expected);
+      const counts = calls.filter(call => call.url.endsWith('/count_tokens'));
+      const lengths = counts.map(call => call.body.messages.length);
+      assert.equal(new Set(lengths).size, lengths.length);
+      assert.ok(lengths.includes(expected.length));
+      requireTurn(result).commit();
+      await engine.prepare('chat', 'next');
+      assert.deepEqual(generations()[1].body.messages.map(message => message.content), [
+        ...expected, 'answer:overflow', 'next',
+      ]);
+    }
+  }
+});
+
 test('failed trimming counts never generate or change committed history', async () => {
   for (const failedLength of [7, 1, 3]) {
     for (const failure of [NaN, new Response('upstream failure', { status: 429 })]) {

@@ -264,7 +264,7 @@ export class ChatEngine implements ChatEngineLike {
         tools: [REPLY_TOOL], tool_choice: REPLY_CHOICE,
       };
       const messagesAfter = (droppedPairs: number): ChatMessage[] => [...history.slice(droppedPairs * 2), user];
-      const count = async (messages: ChatMessage[]): Promise<boolean> => {
+      const count = async (messages: ChatMessage[]): Promise<number> => {
         const result = await request('messages/count_tokens', {
           ...requestOptions,
           messages,
@@ -272,25 +272,38 @@ export class ChatEngine implements ChatEngineLike {
         if (!isRecord(result) || typeof result.input_tokens !== 'number' || !Number.isSafeInteger(result.input_tokens) || result.input_tokens < 0) {
           throw new ChatError('COUNT_FAILED');
         }
-        return result.input_tokens + this.#claude.maxOutputTokens <= this.#claude.contextTokens;
+        return result.input_tokens;
       };
 
+      const inputLimit = this.#claude.contextTokens - this.#claude.maxOutputTokens;
       let messages = messagesAfter(0);
-      if (!await count(messages)) {
+      const fullTokens = await count(messages);
+      if (fullTokens > inputLimit) {
         if (pairCount === 0) throw new ChatError('CONTEXT_TOO_LARGE');
         messages = messagesAfter(1);
-        if (!await count(messages)) {
+        const oneDroppedTokens = await count(messages);
+        if (oneDroppedTokens > inputLimit) {
           if (pairCount === 1) throw new ChatError('CONTEXT_TOO_LARGE');
-          messages = messagesAfter(pairCount);
-          if (!await count(messages)) throw new ChatError('CONTEXT_TOO_LARGE');
-
-          // One dropped pair failed and all dropped pairs fit; neither needs recounting.
+          const savedTokens = fullTokens - oneDroppedTokens;
           let low = 2;
-          let high = pairCount;
+          // Use measured savings only to choose a probe, never to approve an input.
+          let high = savedTokens > 0
+            ? Math.min(pairCount, Math.max(low, Math.ceil((fullTokens - inputLimit) / savedTokens)))
+            : pairCount;
+          messages = messagesAfter(high);
+          if (await count(messages) > inputLimit) {
+            if (high === pairCount) throw new ChatError('CONTEXT_TOO_LARGE');
+            low = high + 1;
+            high = pairCount;
+            messages = messagesAfter(high);
+            if (await count(messages) > inputLimit) throw new ChatError('CONTEXT_TOO_LARGE');
+          }
+
+          // Search only between a rejected boundary and an officially counted fit.
           while (low < high) {
             const middle = Math.floor((low + high) / 2);
             const candidate = messagesAfter(middle);
-            if (await count(candidate)) {
+            if (await count(candidate) <= inputLimit) {
               high = middle;
               messages = candidate;
             } else {
