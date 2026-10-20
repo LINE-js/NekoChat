@@ -260,6 +260,7 @@ export class ChatEngine implements ChatEngineLike {
         // Keep the personality cache reusable when the trigger mode or chat changes.
         system: [...this.#system, {
           type: 'text', text: `${followup ? FOLLOWUP_SYSTEM : DIRECT_SYSTEM}\n${DECISION_SYSTEM}`,
+          cache_control: { type: 'ephemeral' },
         }],
         tools: [REPLY_TOOL], tool_choice: REPLY_CHOICE,
       };
