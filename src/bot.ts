@@ -22,7 +22,8 @@ export type LineRequest =
   | { type: 'ping' | 'pong' }
   | { type: 'chat:admins:get'; requestId: string; chatId: string }
   | { type: 'history:fetch'; requestId: string; chatId: string; limit: number; before?: string }
-  | { type: 'message:send'; requestId: string; chatId: string; text: string; replyTo: string };
+  | { type: 'message:send'; requestId: string; chatId: string; text: string; replyTo: string }
+  | { type: 'chat:admin-token:consume'; requestId: string; chatId: string; token: string };
 
 export interface SentEvent {
   type: 'sent';
@@ -46,7 +47,13 @@ interface HistoryEvent {
   cursor?: unknown;
 }
 
-type ResponseEvent = SentEvent | AdminsEvent | HistoryEvent;
+interface ConsumedEvent {
+  type: 'chat:admin-token:consumed';
+  requestId: string;
+  chatId?: unknown;
+}
+
+type ResponseEvent = SentEvent | AdminsEvent | HistoryEvent | ConsumedEvent;
 type PendingRequest = {
   type: ResponseEvent['type'];
   chatId: string;
@@ -57,6 +64,8 @@ type PendingRequest = {
 interface WaitingMessage {
   message: LineMessage;
   queue: MessageQueue;
+  /** Current admin token found in the text; ownership is proven only by consuming it. */
+  token?: string;
 }
 
 interface MessageQueue {
@@ -75,7 +84,10 @@ export type LineEvent =
   | { type: 'channels'; channels?: unknown }
   | { type: 'message'; message?: unknown }
   | { type: 'message:edit'; message?: unknown }
-  | { type: 'message:unsend'; chatId?: unknown; messageId?: unknown };
+  | { type: 'message:unsend'; chatId?: unknown; messageId?: unknown }
+  | { type: 'chat:admin-token'; requestId?: unknown; chatId?: unknown; token?: unknown }
+  | { type: 'chat:admin-token:consumed'; requestId?: unknown; chatId?: unknown }
+  | { type: 'chat:admin-token:changed'; chatId?: unknown };
 
 function isLineEvent(value: unknown): value is LineEvent {
   if (value === null || typeof value !== 'object' || !('type' in value)) return false;
@@ -83,6 +95,7 @@ function isLineEvent(value: unknown): value is LineEvent {
     case 'ping': case 'pong': case 'hello': case 'auth:state': case 'auth:ready':
     case 'sent': case 'chat:admins': case 'history': case 'error': case 'channels':
     case 'message': case 'message:edit': case 'message:unsend':
+    case 'chat:admin-token': case 'chat:admin-token:consumed': case 'chat:admin-token:changed':
       return true;
     default:
       return false;
@@ -102,6 +115,7 @@ const REQUEST_TIMEOUT = 15_000;
 const HEARTBEAT_INTERVAL = 30_000;
 const HEARTBEAT_TIMEOUT = 10_000;
 const DEDUP_LIMIT = 10_000;
+const ADMIN_TOKEN = /^chatadm_[A-Za-z0-9_-]{43}$/;
 
 function failure(code: string): Error & { code: string } {
   return Object.assign(new Error(code), { code });
@@ -159,6 +173,7 @@ export class ChatBot {
   seen: Map<string, boolean>;
   engaged: Set<string>;
   referenceAuthors: Map<string, { chatId: string; own: boolean }>;
+  adminTokens: Map<string, string>;
   rateQueue: Promise<void>;
   lastSend: number;
   sendTimes: number[];
@@ -192,6 +207,7 @@ export class ChatBot {
     this.seen = new Map();
     this.engaged = new Set();
     this.referenceAuthors = new Map();
+    this.adminTokens = new Map();
     this.rateQueue = Promise.resolve();
     this.lastSend = 0;
     this.sendTimes = [];
@@ -294,6 +310,7 @@ export class ChatBot {
     this.identities.clear();
     this.engaged.clear();
     this.referenceAuthors.clear();
+    this.adminTokens.clear();
     for (const request of [...this.pending.values()]) request.reject(failure('cancelled'));
     this.engine.clearAll();
   }
@@ -436,7 +453,8 @@ export class ChatBot {
       this.log('ready');
       return;
     }
-    if (event.type === 'sent' || event.type === 'chat:admins' || event.type === 'history' || event.type === 'error') {
+    if (event.type === 'sent' || event.type === 'chat:admins' || event.type === 'history' ||
+        event.type === 'chat:admin-token:consumed' || event.type === 'error') {
       if (typeof event.requestId !== 'string') return;
       const pending = this.pending.get(event.requestId);
       if (!pending) return;
@@ -447,6 +465,18 @@ export class ChatBot {
       }
       return;
     }
+    if (event.type === 'chat:admin-token') {
+      // Pushed frames carry no requestId; replacements arrive this way after each consumption.
+      if (event.requestId === undefined && typeof event.chatId === 'string' && this.allowed.has(event.chatId) &&
+          typeof event.token === 'string' && ADMIN_TOKEN.test(event.token)) {
+        this.adminTokens.set(event.chatId, event.token);
+      }
+      return;
+    }
+    if (event.type === 'chat:admin-token:changed') {
+      if (typeof event.chatId === 'string') this.adminTokens.delete(event.chatId);
+      return;
+    }
     if (event.type === 'channels' && Array.isArray(event.channels)) {
       const next = new Set(event.channels.flatMap((channel: unknown) =>
         channel !== null && typeof channel === 'object' && 'channelId' in channel &&
@@ -455,6 +485,7 @@ export class ChatBot {
         ...Array.from(this.referenceAuthors.values(), author => author.chatId)])) {
         if (!next.has(chatId)) this.cancelChat(chatId);
       }
+      for (const chatId of this.adminTokens.keys()) if (!next.has(chatId)) this.adminTokens.delete(chatId);
       // Purge once rather than rescanning every author for each removed chat.
       for (const [key, author] of this.referenceAuthors) {
         if (!next.has(author.chatId)) this.referenceAuthors.delete(key);
@@ -505,17 +536,19 @@ export class ChatBot {
       this.rememberAuthor(message.channelId, message.messageId, message.senderId === ownId);
       if (message.senderId === ownId) return;
     }
+    const adminToken = this.adminTokens.get(message.channelId);
+    const token = adminToken && message.text.includes(adminToken) ? adminToken : undefined;
     // Pending work may engage the chat before this message is processed.
-    if (!this.engaged.has(message.channelId) && !this.jobs.has(message.channelId) &&
+    if (!token && !this.engaged.has(message.channelId) && !this.jobs.has(message.channelId) &&
         !(typeof message.replyTo === 'string' && message.replyTo &&
           this.knownAuthor(message.channelId, message.replyTo) !== false) &&
         !(typeof ownId === 'string'
           ? this.isDirect(message, ownId)
           : message.text.includes('語喵') || (Array.isArray(message.mentions) && message.mentions.length > 0))) return;
-    this.enqueue(message);
+    this.enqueue(message, token);
   }
 
-  enqueue(message: LineMessage): void {
+  enqueue(message: LineMessage, token?: string): void {
     if (this.stopped || !this.ready) return;
     const chatId = message.channelId;
     let queue = this.jobs.get(chatId);
@@ -546,7 +579,7 @@ export class ChatBot {
       queue = { chatId, waiting: [] };
       this.jobs.set(chatId, queue);
     }
-    const entry = { message, queue };
+    const entry: WaitingMessage = { message, queue, ...(token ? { token } : {}) };
     queue.waiting.push(entry);
     this.waiting.add(entry);
     this.outstanding++;
@@ -563,7 +596,7 @@ export class ChatBot {
     this.waiting.delete(entry);
     const controller = new AbortController();
     queue.active = controller;
-    void this.reply(entry.message, controller.signal).catch((error: unknown) => {
+    void this.reply(entry.message, controller.signal, entry.token).catch((error: unknown) => {
       if (!controller.signal.aborted) this.log(error !== null && typeof error === 'object' &&
         'code' in error && error.code === 'identity_unavailable' ? 'identity_unavailable' : 'reply_failed');
     }).finally(() => {
@@ -597,21 +630,39 @@ export class ChatBot {
     return identity;
   }
 
-  async reply(message: LineMessage, signal: AbortSignal): Promise<void> {
+  async consumeAdminToken(chatId: string, token: string, signal: AbortSignal): Promise<boolean> {
+    if (!this.capabilities.has('chat:admin-token')) return false;
+    try {
+      const event = await this.request('chat:admin-token:consume', { chatId, token }, 'chat:admin-token:consumed', signal);
+      return event.type === 'chat:admin-token:consumed' && event.chatId === chatId;
+    } catch {
+      if (!signal.aborted) this.log('admin_token_rejected');
+      return false;
+    }
+  }
+
+  async reply(message: LineMessage, signal: AbortSignal, token?: string): Promise<void> {
     if (signal.aborted || !this.ready) return;
     const ownId = await this.ownId(message, signal);
     if (!ownId || signal.aborted) return;
     this.rememberAuthor(message.channelId, message.messageId, message.senderId === ownId);
     if (message.senderId === ownId) return;
-    const direct = this.isDirect(message, ownId) || await this.isHistoricalReply(message, ownId, signal);
+    // The server's one-time redemption is the proof; text alone never grants ownership.
+    const owner = token !== undefined && await this.consumeAdminToken(message.channelId, token, signal);
+    if (signal.aborted) return;
+    const direct = owner || this.isDirect(message, ownId) || await this.isHistoricalReply(message, ownId, signal);
     if (signal.aborted) return;
     if (!direct && !this.engaged.has(message.channelId)) return;
     const name = typeof message.senderName === 'string' ? message.senderName : message.senderId;
     const input = JSON.stringify({
-      sender: { id: message.senderId, name }, text: message.text,
+      sender: { id: message.senderId, name },
+      // Never forward the secret to the model or retained context.
+      text: token === undefined ? message.text : message.text.replaceAll(token, '[權杖]'),
       ...(typeof message.replyTo === 'string' && message.replyTo ? { replyTo: message.replyTo } : {}),
+      ...(owner ? { verifiedOwner: true } : {}),
     });
-    const result = await this.engine.prepare(message.channelId, input, signal, { followup: !direct });
+    const result = await this.engine.prepare(message.channelId, input, signal,
+      owner ? { followup: false, owner: true } : { followup: !direct });
     if (signal.aborted || !result) return;
     const chunks = splitText(result.text, this.config.line.textMaxLength);
     for (const text of chunks) {
@@ -670,6 +721,7 @@ export class ChatBot {
       | [type: 'chat:admins:get', payload: { chatId: string }, expectedType: 'chat:admins', signal: AbortSignal]
       | [type: 'history:fetch', payload: { chatId: string; limit: number; before?: string }, expectedType: 'history', signal: AbortSignal]
       | [type: 'message:send', payload: { chatId: string; text: string; replyTo: string }, expectedType: 'sent', signal: AbortSignal]
+      | [type: 'chat:admin-token:consume', payload: { chatId: string; token: string }, expectedType: 'chat:admin-token:consumed', signal: AbortSignal]
   ): Promise<ResponseEvent> {
     if (signal.aborted) return Promise.reject(failure('cancelled'));
     const requestId = randomUUID();
@@ -698,6 +750,7 @@ export class ChatBot {
         try {
           if (type === 'message:send') this.send({ type, requestId, ...payload });
           else if (type === 'history:fetch') this.send({ type, requestId, ...payload });
+          else if (type === 'chat:admin-token:consume') this.send({ type, requestId, ...payload });
           else this.send({ type, requestId, ...payload });
           if (type !== 'message:send') this.queryTimes.push(Date.now());
         } catch {

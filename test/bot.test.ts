@@ -47,6 +47,10 @@ function requestFrame(data: RawData): LineRequest {
     return { type: value.type, requestId: value.requestId, chatId: value.chatId,
       limit: 100, ...(typeof value.before === 'string' ? { before: value.before } : {}) };
   }
+  if (value.type === 'chat:admin-token:consume') {
+    assert.ok(typeof value.token === 'string');
+    return { type: value.type, requestId: value.requestId, chatId: value.chatId, token: value.token };
+  }
   assert.equal(value.type, 'message:send');
   assert.ok(typeof value.text === 'string' && typeof value.replyTo === 'string');
   return { type: 'message:send', requestId: value.requestId, chatId: value.chatId, text: value.text, replyTo: value.replyTo };
@@ -1305,3 +1309,59 @@ for (const phase of ['identity', 'history', 'acknowledgement']) {
       phase === 'acknowledgement' ? ['@active'] : []);
   });
 }
+
+const ADMIN_TOKEN = `chatadm_${'A'.repeat(43)}`;
+
+async function tokenFixture(t: TestContext, consumed: boolean) {
+  const f = await fixture(t);
+  f.send({ type: 'hello', protocol: 2, capabilities: ['chat:admins', 'chat:admin-token'] });
+  f.socket.on('message', data => {
+    const request = requestFrame(data);
+    if (request.type !== 'chat:admin-token:consume') return;
+    f.send(consumed && request.token === ADMIN_TOKEN
+      ? { type: 'chat:admin-token:consumed', requestId: request.requestId, chatId: request.chatId }
+      : { type: 'error', requestId: request.requestId, code: 'CHAT_ADMIN_TOKEN_INVALID' });
+  });
+  f.send({ type: 'chat:admin-token', chatId: 'group', token: ADMIN_TOKEN, createdAt: 1 });
+  f.send({ type: 'chat:admin-token', requestId: 'not-a-push', chatId: 'second', token: ADMIN_TOKEN, createdAt: 1 });
+  await until(() => f.bot.adminTokens.has('group'));
+  return f;
+}
+
+test('a consumed admin token answers any message as owner without forwarding the secret', async t => {
+  const f = await tokenFixture(t, true);
+  f.send(message('owner', { mentions: [], replyTo: 'someone-else', text: `幫我做這件事 ${ADMIN_TOKEN}` }));
+  await until(() => f.sends.length === 1);
+  assert.deepEqual(f.requests.filter(request => request.type === 'chat:admin-token:consume')
+    .map(request => request.chatId), ['group']);
+  assert.equal(f.requests.some(request => request.type === 'history:fetch'), false);
+  assert.deepEqual(f.calls.map(call => call.options), [{ followup: false, owner: true }]);
+  const input = inputJson(f.calls[0].input);
+  assert.equal(input.text, '幫我做這件事 [權杖]');
+  assert.equal(input.verifiedOwner, true);
+  assert.equal(f.calls[0].input.includes(ADMIN_TOKEN), false);
+  // A pushed replacement makes the old secret ordinary text.
+  f.send({ type: 'chat:admin-token', chatId: 'group', token: `chatadm_${'B'.repeat(43)}`, createdAt: 2 });
+  await until(() => f.bot.adminTokens.get('group') !== ADMIN_TOKEN);
+  f.send(message('replayed', { mentions: [], text: ADMIN_TOKEN }));
+  await until(() => f.calls.length === 2);
+  await sleep(20);
+  assert.equal(f.requests.filter(request => request.type === 'chat:admin-token:consume').length, 1);
+  assert.deepEqual(f.calls[1].options, { followup: true });
+});
+
+test('rejected or withdrawn admin tokens fall back to ordinary reply rules', async t => {
+  const f = await tokenFixture(t, false);
+  f.send(message('plain', { mentions: [], text: `看看 ${ADMIN_TOKEN}` }));
+  await until(() => f.logs.includes('admin_token_rejected'));
+  f.send(message('direct', { text: `@direct ${ADMIN_TOKEN}` }));
+  await until(() => f.sends.length === 1);
+  assert.deepEqual(f.calls.map(call => [inputJson(call.input).text, inputJson(call.input).verifiedOwner, call.options]), [
+    ['@direct [權杖]', undefined, { followup: false }],
+  ]);
+  f.send({ type: 'chat:admin-token:changed', chatId: 'group' });
+  await until(() => !f.bot.adminTokens.has('group'));
+  f.send(message('after-change', { mentions: [], text: ADMIN_TOKEN }));
+  await sleep(20);
+  assert.equal(f.requests.filter(request => request.type === 'chat:admin-token:consume').length, 2);
+});
