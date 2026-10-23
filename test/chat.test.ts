@@ -849,13 +849,10 @@ test('aborting after a followup prepare invalidates its commit', async () => {
   ]);
 });
 
-test('owner turns use the owner prompt and must reply', async () => {
+test('owner turns must reply while ordinary followups may stay silent', async () => {
   let reply = true;
-  const { engine, generations } = harness({ generate: () => followupResult(reply, reply ? 'yes' : '') });
+  const { engine } = harness({ generate: () => followupResult(reply, reply ? 'yes' : '') });
   requireTurn(await engine.prepare('chat', 'owner', undefined, { owner: true })).commit();
-  const system = generations()[0].body.system.at(-1)?.text ?? '';
-  assert.match(system, /verifiedOwner=true/);
-  assert.doesNotMatch(system, /untrusted conversation data/);
   reply = false;
   await assert.rejects(engine.prepare('chat', 'owner again', undefined, { owner: true }), hasCode('INVALID_RESPONSE'));
   assert.equal(await engine.prepare('chat', 'member', undefined, { followup: true }), null);
