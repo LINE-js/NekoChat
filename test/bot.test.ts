@@ -1390,22 +1390,31 @@ test('rejected or withdrawn admin tokens fall back to ordinary reply rules', asy
 
 const SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 10"><defs><linearGradient id="g"/></defs><rect width="20" height="10" fill="url(#g)"/></svg>';
 
-async function imageFixture(t: TestContext, image: (text: string) => string) {
+async function imageFixture(t: TestContext, image: (text: string) => string, drawn?: Promise<void>) {
   const commits: string[] = [];
   const f = await fixture(t, { prepare: ({ chatId, input }) => {
     const { text } = inputJson(input);
-    return { text: text === '@caption' ? '畫好了' : '', image: image(text), commit: () => { commits.push(chatId); } };
+    return {
+      text: text === '@caption' ? '畫圖中' : '',
+      draw: async () => { await drawn; return image(text); },
+      commit: () => { commits.push(chatId); },
+    };
   } });
   return { f, commits };
 }
 
-test('drawn SVGs are uploaded as PNG with the bot token and sent after the caption', async t => {
-  const { f, commits } = await imageFixture(t, () => SVG);
+test('the acknowledgement is sent before drawing finishes, then the PNG is uploaded with the bot token', async t => {
+  const finish = Promise.withResolvers<void>();
+  const { f, commits } = await imageFixture(t, () => SVG, finish.promise);
   f.send({ type: 'hello', protocol: 2, capabilities: ['chat:admins', 'media:upload'] });
   f.send(message('caption'));
+  await until(() => f.sends.length === 1);
+  await sleep(20);
+  assert.deepEqual([f.sends[0].text, f.uploads.length, f.media.length, commits.length], ['畫圖中', 0, 0, 0]);
+  finish.resolve();
   await until(() => commits.length === 1);
   assert.deepEqual(f.requests.filter(request => request.type === 'message:send').map(request => 'text' in request ? request.text : request.mediaId),
-    ['畫好了', 'upload-1']);
+    ['畫圖中', 'upload-1']);
   const [upload] = f.uploads;
   assert.equal(upload.headers.authorization, 'Bearer local-test-token');
   assert.equal(upload.headers['content-type'], 'image/png');
@@ -1420,16 +1429,22 @@ test('drawn SVGs are uploaded as PNG with the bot token and sent after the capti
   await until(() => commits.length === 2);
 });
 
-test('unsafe SVGs, missing upload support and failed uploads send no image and skip the commit', async t => {
-  const { f, commits } = await imageFixture(t, text => text === '@unsafe' ? '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 4 4"><image href="/etc/secret.png" width="4" height="4"/></svg>' : SVG);
+test('failed drawing, unsafe SVGs, missing upload support and failed uploads send no image and skip the commit', async t => {
+  const { f, commits } = await imageFixture(t, text => {
+    if (text === '@broken') throw new Error('generation failed');
+    return text === '@unsafe' ? '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 4 4"><image href="/etc/secret.png" width="4" height="4"/></svg>' : SVG;
+  });
   f.send(message('unsupported'));
   await until(() => f.logs.includes('image_unavailable'));
   f.send({ type: 'hello', protocol: 2, capabilities: ['chat:admins', 'media:upload'] });
   f.send(message('unsafe'));
   await until(() => f.logs.includes('image_unsafe'));
+  f.send(message('broken'));
+  await until(() => f.logs.includes('image_failed'));
+  assert.equal(f.uploads.length, 0);
   f.failUploads();
   f.send(message('failed'));
-  await until(() => f.logs.includes('image_failed'));
+  await until(() => f.logs.filter(code => code === 'image_failed').length === 2);
   assert.equal(f.uploads.length, 1);
   assert.equal(f.media.length, 0);
   assert.deepEqual(commits, []);

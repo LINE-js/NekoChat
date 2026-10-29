@@ -4,8 +4,8 @@ import { isRecord } from './guards.js';
 
 export interface PreparedTurn {
   text: string;
-  /** Self-contained SVG source the bot renders and sends after the text. */
-  image?: string;
+  /** Generates the requested picture as SVG; called after the acknowledging text is sent. */
+  draw?: (signal: AbortSignal) => Promise<string>;
   /** Attachment the bot uploads after the text (and image); the name selects the format. */
   file?: { name: string; content: string };
   commit(): void;
@@ -121,10 +121,10 @@ const REPLY_TOOL = {
     type: 'object',
     properties: {
       shouldReply: { type: 'boolean' },
-      reply: { type: 'string', description: 'Natural chat reply when shouldReply is true; otherwise an empty string. May be empty when image or file is set.' },
-      image: {
+      reply: { type: 'string', description: 'Natural chat reply when shouldReply is true; otherwise an empty string. May be empty when file is set.' },
+      draw: {
         type: 'string',
-        description: 'Only when asked to draw or create a picture: one complete, self-contained SVG document with a viewBox, rendered to PNG and sent to the chat. Keep it concise; use only inline shapes, gradients and generic font families; never <image>, <foreignObject>, scripts, external links or url() except #fragments. Omit otherwise.',
+        description: 'Only when asked to draw or create a picture: a concise description of the picture. It is drawn after your reply is sent, so reply must briefly acknowledge that you are starting to draw and must not claim it is finished. Omit otherwise.',
       },
       file: {
         type: 'object',
@@ -149,6 +149,27 @@ Reply only with clear conversational evidence: a response to your question, a fo
 question about your answer, or a continuation addressed to you. A shared topic alone is
 not enough. An exchange addressed to another member, unrelated messages, and ambiguous
 connections must have shouldReply=false and reply="".`;
+
+const DRAW_TOOL = {
+  name: 'draw_svg',
+  description: 'Return the finished picture; this performs no external action.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      svg: {
+        type: 'string',
+        description: 'One complete, self-contained SVG document with a viewBox. Keep it concise; use only inline shapes, gradients and generic font families; never <image>, <foreignObject>, scripts, external links or url() except #fragments.',
+      },
+    },
+    required: ['svg'],
+    additionalProperties: false,
+  },
+};
+const DRAW_CHOICE = { type: 'tool', name: DRAW_TOOL.name, disable_parallel_tool_use: true };
+const DRAW_SYSTEM = `
+You already told the member you are drawing. Draw the picture requested in the latest message,
+as described below, in your usual style. Call draw_svg exactly once; it is rendered to PNG and sent.
+Description:`;
 
 const DECISION_SYSTEM = `
 Be engaged and warm in exchanges clearly addressed to you, without forced jokes,
@@ -218,19 +239,8 @@ export class ChatEngine implements ChatEngineLike {
     this.#chats.clear();
   }
 
-  async prepare(chatId: string, input: string, signal?: AbortSignal, { followup = false, owner = false }: PrepareOptions = {}): Promise<PreparedTurn | null> {
-    if (typeof chatId !== 'string' || !chatId || typeof input !== 'string' || !input.trim()) {
-      throw new ChatError('INVALID_INPUT');
-    }
-    if (signal?.aborted) throw new ChatError('ABORTED');
-
-    let state = this.#chats.get(chatId);
-    if (!state) {
-      state = { messages: [], revision: 0 };
-      this.#chats.set(chatId, state);
-    }
-    const revision = state.revision;
-    if (followup && state.messages.length === 0) return null;
+  /** One deadline-bound unit of API work; dispose() must run when it ends. */
+  #session(signal?: AbortSignal) {
     const controller = new AbortController();
     let timedOut = false;
     const onAbort = () => controller.abort();
@@ -284,7 +294,27 @@ export class ChatEngine implements ChatEngineLike {
         throw new ChatError(failureCode, response?.status);
       }
     };
+    const dispose = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+    };
+    return { request, dispose };
+  }
 
+  async prepare(chatId: string, input: string, signal?: AbortSignal, { followup = false, owner = false }: PrepareOptions = {}): Promise<PreparedTurn | null> {
+    if (typeof chatId !== 'string' || !chatId || typeof input !== 'string' || !input.trim()) {
+      throw new ChatError('INVALID_INPUT');
+    }
+    if (signal?.aborted) throw new ChatError('ABORTED');
+
+    let state = this.#chats.get(chatId);
+    if (!state) {
+      state = { messages: [], revision: 0 };
+      this.#chats.set(chatId, state);
+    }
+    const revision = state.revision;
+    if (followup && state.messages.length === 0) return null;
+    const { request, dispose } = this.#session(signal);
     try {
       const user: ChatMessage = { role: 'user', content: input };
       const history = state.messages;
@@ -361,7 +391,7 @@ export class ChatEngine implements ChatEngineLike {
       const content: unknown = isRecord(result) ? result.content : undefined;
       const block: unknown = Array.isArray(content) ? content[0] : undefined;
       const decision: unknown = isRecord(block) ? block.input : undefined;
-      const image: unknown = isRecord(decision) ? decision.image : undefined;
+      const draw: unknown = isRecord(decision) ? decision.draw : undefined;
       const file: unknown = isRecord(decision) ? decision.file : undefined;
       if (
         !isRecord(result) || result.stop_reason !== 'tool_use' ||
@@ -369,9 +399,9 @@ export class ChatEngine implements ChatEngineLike {
         !isRecord(block) || block.type !== 'tool_use' || block.name !== REPLY_TOOL.name ||
         typeof block.id !== 'string' || !block.id.trim() ||
         !isRecord(decision) ||
-        Object.keys(decision).length !== 2 + Number(image !== undefined) + Number(file !== undefined) ||
+        Object.keys(decision).length !== 2 + Number(draw !== undefined) + Number(file !== undefined) ||
         typeof decision.shouldReply !== 'boolean' || typeof decision.reply !== 'string' ||
-        (image !== undefined && (typeof image !== 'string' || !image.trim() || !decision.shouldReply)) ||
+        (draw !== undefined && (typeof draw !== 'string' || !draw.trim() || !decision.shouldReply)) ||
         (file !== undefined && (!isRecord(file) || Object.keys(file).length !== 2 ||
           typeof file.name !== 'string' || typeof file.content !== 'string' || !file.content.trim() ||
           !decision.shouldReply)) ||
@@ -383,17 +413,18 @@ export class ChatEngine implements ChatEngineLike {
         if (owner) throw new ChatError('INVALID_RESPONSE');
         return null;
       }
-      const text = decision.reply;
+      // Drawing takes a while; members must see an acknowledgement before the picture arrives.
+      const text = typeof draw === 'string' && !decision.reply.trim() ? '收到，正在畫圖，請稍等。' : decision.reply;
       const attachment = isRecord(file) ? { name: file.name as string, content: file.content as string } : undefined;
-      if (!text.trim() && image === undefined && !attachment) throw new ChatError('INVALID_RESPONSE');
+      if (!text.trim() && !attachment) throw new ChatError('INVALID_RESPONSE');
       // Retain only markers: SVG source and file bodies would inflate every later request.
-      const retained = [text, image === undefined ? '' : '（附上一張圖片）', attachment ? `（附上檔案 ${attachment.name}）` : '']
+      const retained = [text, draw === undefined ? '' : '（附上一張圖片）', attachment ? `（附上檔案 ${attachment.name}）` : '']
         .filter(Boolean).join('\n');
       const completed: ChatMessage[] = [...messages, { role: 'assistant', content: retained }];
       let committed = false;
       return {
         text,
-        ...(typeof image === 'string' ? { image } : {}),
+        ...(typeof draw === 'string' ? { draw: (drawSignal: AbortSignal) => this.#draw(draw, messages, drawSignal) } : {}),
         ...(attachment ? { file: attachment } : {}),
         commit: () => {
           if (
@@ -406,8 +437,31 @@ export class ChatEngine implements ChatEngineLike {
         },
       };
     } finally {
-      clearTimeout(timer);
-      signal?.removeEventListener('abort', onAbort);
+      dispose();
+    }
+  }
+
+  async #draw(description: string, messages: ChatMessage[], signal: AbortSignal): Promise<string> {
+    if (signal.aborted) throw new ChatError('ABORTED');
+    const { request, dispose } = this.#session(signal);
+    try {
+      // Reuses the counted decision context: the draw tool is smaller than the decision tool.
+      const result = await request('messages', {
+        model: this.#claude.model,
+        system: [...this.#system, { type: 'text', text: `${DRAW_SYSTEM}\n${description}` }],
+        tools: [DRAW_TOOL], tool_choice: DRAW_CHOICE,
+        messages,
+        max_tokens: this.#claude.maxOutputTokens,
+      }, 'GENERATION_FAILED');
+      if (isRecord(result) && result.stop_reason === 'max_tokens') throw new ChatError('OUTPUT_TRUNCATED');
+      const content: unknown = isRecord(result) ? result.content : undefined;
+      const block: unknown = Array.isArray(content) && content.length === 1 ? content[0] : undefined;
+      const svg: unknown = isRecord(block) && block.type === 'tool_use' && block.name === DRAW_TOOL.name && isRecord(block.input)
+        ? block.input.svg : undefined;
+      if (typeof svg !== 'string' || !svg.trim()) throw new ChatError('INVALID_RESPONSE');
+      return svg;
+    } finally {
+      dispose();
     }
   }
 }

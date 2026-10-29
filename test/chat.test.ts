@@ -6,6 +6,7 @@ import { setImmediate } from 'node:timers/promises';
 import type { Transform, TransformCallback } from 'node:stream';
 import { createGzip, gunzipSync } from 'node:zlib';
 import { ChatEngine, ChatError } from '../src/chat.js';
+import { isRecord } from '../src/guards.js';
 import type { ChatFetchOptions, ChatMessage, PreparedTurn } from '../src/chat.js';
 import type { ClaudeConfig } from '../src/config.js';
 
@@ -858,21 +859,40 @@ test('owner turns must reply while ordinary followups may stay silent', async ()
   assert.equal(await engine.prepare('chat', 'member', undefined, { followup: true }), null);
 });
 
-test('image decisions return the SVG, retain only a marker and reject malformed images', async () => {
-  let input: Record<string, unknown> = { shouldReply: true, reply: '', image: '<svg/>' };
-  const { engine, generations } = harness({ generate: () => ({
-    stop_reason: 'tool_use', content: [{ type: 'tool_use', id: 'toolu_image', name: 'conversation_reply', input }],
+test('draw decisions acknowledge first, then draw with the decision context in a second request', async () => {
+  let input: Record<string, unknown> = { shouldReply: true, reply: '', draw: '一隻灰貓' };
+  let drawn: unknown = { svg: '<svg/>' };
+  const { engine, generations } = harness({ generate: body => ({
+    stop_reason: 'tool_use',
+    content: [isRecord(body.tool_choice) && body.tool_choice.name === 'draw_svg'
+      ? { type: 'tool_use', id: 'toolu_draw', name: 'draw_svg', input: drawn }
+      : { type: 'tool_use', id: 'toolu_image', name: 'conversation_reply', input }],
   }) });
   const turn = requireTurn(await engine.prepare('chat', 'draw'));
-  assert.deepEqual([turn.text, turn.image], ['', '<svg/>']);
+  // An empty reply still yields an acknowledgement so the member knows drawing started.
+  assert.equal(turn.text, '收到，正在畫圖，請稍等。');
+  assert.ok(turn.draw);
+  assert.equal(generations().length, 1);
+  assert.equal(await turn.draw(new AbortController().signal), '<svg/>');
+  const request = generations()[1].body;
+  assert.deepEqual(request.messages.map(message => message.content), ['draw']);
+  assert.match(request.system.at(-1)?.text ?? '', /一隻灰貓/);
   turn.commit();
+  for (const bad of [{ svg: ' ' }, {}, 'x']) {
+    drawn = bad;
+    await assert.rejects(turn.draw(new AbortController().signal), hasCode('INVALID_RESPONSE'));
+  }
+  const aborted = new AbortController();
+  aborted.abort();
+  await assert.rejects(turn.draw(aborted.signal), hasCode('ABORTED'));
   input = { shouldReply: true, reply: 'next' };
   requireTurn(await engine.prepare('chat', 'again'));
-  assert.deepEqual(generations().at(-1)?.body.messages.map(message => message.content), ['draw', '（附上一張圖片）', 'again']);
+  assert.deepEqual(generations().at(-1)?.body.messages.map(message => message.content),
+    ['draw', '收到，正在畫圖，請稍等。\n（附上一張圖片）', 'again']);
   for (const bad of [
-    { shouldReply: false, reply: '', image: '<svg/>' },
-    { shouldReply: true, reply: 'x', image: ' ' },
-    { shouldReply: true, reply: 'x', image: 1 },
+    { shouldReply: false, reply: '', draw: 'x' },
+    { shouldReply: true, reply: 'x', draw: ' ' },
+    { shouldReply: true, reply: 'x', draw: 1 },
   ]) {
     input = bad;
     await assert.rejects(engine.prepare('chat', 'bad'), hasCode('INVALID_RESPONSE'));
@@ -880,12 +900,12 @@ test('image decisions return the SVG, retain only a marker and reject malformed 
 });
 
 test('file decisions return the attachment, retain a named marker and reject malformed files', async () => {
-  let input: Record<string, unknown> = { shouldReply: true, reply: '給你', image: '<svg/>', file: { name: 'a.md', content: '# 標題' } };
+  let input: Record<string, unknown> = { shouldReply: true, reply: '給你', draw: '圖', file: { name: 'a.md', content: '# 標題' } };
   const { engine, generations } = harness({ generate: () => ({
     stop_reason: 'tool_use', content: [{ type: 'tool_use', id: 'toolu_file', name: 'conversation_reply', input }],
   }) });
   const turn = requireTurn(await engine.prepare('chat', 'make'));
-  assert.deepEqual([turn.text, turn.image, turn.file], ['給你', '<svg/>', { name: 'a.md', content: '# 標題' }]);
+  assert.deepEqual([turn.text, typeof turn.draw, turn.file], ['給你', 'function', { name: 'a.md', content: '# 標題' }]);
   turn.commit();
   input = { shouldReply: true, reply: 'next' };
   requireTurn(await engine.prepare('chat', 'again'));

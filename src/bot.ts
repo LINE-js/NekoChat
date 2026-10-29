@@ -646,8 +646,11 @@ export class ChatBot {
     }
   }
 
-  async uploadImage(svg: string, signal: AbortSignal): Promise<string> {
+  async uploadImage(draw: (signal: AbortSignal) => Promise<string>, signal: AbortSignal): Promise<string> {
     if (!this.capabilities.has('media:upload')) throw failure('image_unavailable');
+    let svg: string;
+    try { svg = await draw(signal); }
+    catch { throw failure(signal.aborted ? 'cancelled' : 'image_failed'); }
     return this.upload(renderSvg(svg), { 'content-type': 'image/png' }, 'image_failed', signal);
   }
 
@@ -710,9 +713,9 @@ export class ChatBot {
     const result = await this.engine.prepare(message.channelId, input, signal,
       owner ? { followup: false, owner: true } : { followup: !direct });
     if (signal.aborted || !result) return;
-    // Render and upload while the text goes out; upload IDs stay valid for ten minutes.
+    // Draw, render and upload while the acknowledging text goes out; upload IDs stay valid for ten minutes.
     const media = [
-      result.image === undefined ? undefined : this.uploadImage(result.image, signal),
+      result.draw === undefined ? undefined : this.uploadImage(result.draw, signal),
       result.file === undefined ? undefined : this.uploadFile(result.file, signal),
     ].filter(upload => upload !== undefined);
     for (const upload of media) upload.catch(() => {});
