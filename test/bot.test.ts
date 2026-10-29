@@ -1,11 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
+import { existsSync } from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
 import type { TestContext } from 'node:test';
 import { createServer, type IncomingHttpHeaders } from 'node:http';
-import type { LineConfig } from '../src/config.js';
+import type { LineConfig, PdfFont } from '../src/config.js';
 import type { ChatEngineLike, PreparedTurn, PrepareOptions } from '../src/chat.js';
 import { isRecord } from '../src/guards.js';
 import { ChatBot, type LineMessage, type LineRequest } from '../src/bot.js';
@@ -22,6 +23,7 @@ interface FixtureOptions {
   line?: Partial<LineConfig>;
   handshake?: boolean;
   acknowledge?: boolean;
+  pdfFont?: PdfFont;
   history?: (request: Extract<LineRequest, { type: 'history:fetch' }>) => {
     messages: unknown[]; hasMore: boolean; cursor?: string; chatId?: string;
   } | null;
@@ -85,7 +87,7 @@ function message(id: string, overrides: Partial<LineMessage> = {}) {
   } };
 }
 
-async function fixture(t: TestContext, { prepare, line = {}, handshake = true, acknowledge = true, history }: FixtureOptions = {}) {
+async function fixture(t: TestContext, { prepare, line = {}, handshake = true, acknowledge = true, history, pdfFont }: FixtureOptions = {}) {
   const uploads: { headers: IncomingHttpHeaders; body: Buffer }[] = [];
   let uploadStatus = 200;
   const http = createServer(async (request, response) => {
@@ -134,7 +136,7 @@ async function fixture(t: TestContext, { prepare, line = {}, handshake = true, a
     url: `ws://127.0.0.1:${address.port}/api/ws`, token: 'local-test-token',
     chats: ['group', 'second', 'square'], ownMemberIds: {}, textMaxLength: 8000,
     sendsPerMinute: 240, maxPendingPerChat: 50, maxPendingTotal: 200, ...line,
-  } }, engine, log: code => logs.push(code) });
+  }, ...(pdfFont ? { pdfFont } : {}) }, engine, log: code => logs.push(code) });
   t.after(async () => {
     bot.stop();
     await bot.closed;
@@ -1431,4 +1433,59 @@ test('unsafe SVGs, missing upload support and failed uploads send no image and s
   assert.equal(f.uploads.length, 1);
   assert.equal(f.media.length, 0);
   assert.deepEqual(commits, []);
+});
+
+async function fileFixture(t: TestContext, file: (text: string) => { name: string; content: string }, pdfFont?: PdfFont) {
+  const commits: string[] = [];
+  const f = await fixture(t, { pdfFont, prepare: ({ chatId, input }) => ({
+    text: '', file: file(inputJson(input).text), commit: () => { commits.push(chatId); },
+  }) });
+  f.send({ type: 'hello', protocol: 2, capabilities: ['chat:admins', 'media:upload'] });
+  return { f, commits };
+}
+
+test('text attachments upload as UTF-8 with the encoded file name', async t => {
+  const { f, commits } = await fileFixture(t, text => ({ name: text === '@csv' ? '報表 1.csv' : 'notes.MD', content: '名稱,數量\n貓,1\t\r\n' }));
+  f.send(message('csv'));
+  await until(() => commits.length === 1);
+  f.send(message('md'));
+  await until(() => commits.length === 2);
+  assert.deepEqual(f.media.map(request => request.mediaId), ['upload-1', 'upload-2']);
+  assert.equal(f.sends.length, 0);
+  assert.deepEqual(f.uploads.map(upload => [upload.headers['x-file-name'], upload.headers['content-type'], upload.body.toString()]), [
+    [encodeURIComponent('報表 1.csv'), 'text/plain; charset=utf-8', '名稱,數量\n貓,1\t\r\n'],
+    ['notes.MD', 'text/plain; charset=utf-8', '名稱,數量\n貓,1\t\r\n'],
+  ]);
+});
+
+test('invalid attachments and PDFs without a CJK font are refused before upload', async t => {
+  const { f, commits } = await fileFixture(t, text => ({
+    '@ext': { name: 'run.sh', content: 'x' },
+    '@path': { name: '../a.txt', content: 'x' },
+    '@control': { name: 'a.txt', content: 'a\u0000b' },
+  }[text] ?? { name: 'a.pdf', content: 'x' }));
+  for (const id of ['ext', 'path', 'control']) {
+    f.send(message(id));
+    await until(() => f.logs.filter(code => code === 'file_invalid').length === ['ext', 'path', 'control'].indexOf(id) + 1);
+  }
+  f.send(message('pdf'));
+  await until(() => f.logs.includes('file_unavailable'));
+  assert.equal(f.uploads.length, 0);
+  assert.deepEqual(commits, []);
+});
+
+const SYSTEM_CJK_FONT = [
+  { file: '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc', name: 'NotoSansCJKtc-Regular' },
+  { file: '/System/Library/Fonts/Hiragino Sans GB.ttc', name: 'HiraginoSansGB-W3' },
+].find(font => existsSync(font.file));
+
+test('PDF attachments are typeset with the configured font', { skip: !SYSTEM_CJK_FONT && 'no system CJK font' }, async t => {
+  const { f, commits } = await fileFixture(t, () => ({ name: '說明.pdf', content: '語喵的文件\n第二行' }), SYSTEM_CJK_FONT);
+  f.send(message('pdf'));
+  await until(() => commits.length === 1);
+  const [upload] = f.uploads;
+  assert.equal(upload.headers['content-type'], 'application/pdf');
+  assert.equal(upload.headers['x-file-name'], encodeURIComponent('說明.pdf'));
+  assert.equal(upload.body.subarray(0, 5).toString(), '%PDF-');
+  assert.deepEqual(f.media.map(request => request.mediaId), ['upload-1']);
 });

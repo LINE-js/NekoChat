@@ -1,9 +1,10 @@
 import WebSocket from 'ws';
 import { randomUUID } from 'node:crypto';
-import type { LineConfig } from './config.js';
+import type { LineConfig, PdfFont } from './config.js';
 import type { ChatEngineLike } from './chat.js';
 import { isRecord } from './guards.js';
 import { renderSvg } from './image.js';
+import { renderPdf } from './document.js';
 
 export interface LineMessage {
   channelId: string;
@@ -163,7 +164,7 @@ function splitText(text: string, maximum: number): string[] {
 }
 
 export class ChatBot {
-  config: { line: LineConfig };
+  config: { line: LineConfig; pdfFont?: PdfFont };
   engine: ChatEngineLike;
   log: (code: string) => void;
   allowed: Set<string>;
@@ -195,7 +196,7 @@ export class ChatBot {
   userId: string | undefined;
   channels: Set<string> | undefined;
   constructor({ config, engine, log = () => {} }: {
-    config: { line: LineConfig }; engine: ChatEngineLike; log?: (code: string) => void;
+    config: { line: LineConfig; pdfFont?: PdfFont }; engine: ChatEngineLike; log?: (code: string) => void;
   }) {
     this.config = config;
     this.engine = engine;
@@ -600,7 +601,8 @@ export class ChatBot {
     queue.active = controller;
     void this.reply(entry.message, controller.signal, entry.token).catch((error: unknown) => {
       if (!controller.signal.aborted) this.log(error !== null && typeof error === 'object' && 'code' in error &&
-        ['identity_unavailable', 'image_unavailable', 'image_unsafe', 'image_invalid', 'image_failed'].includes(error.code as string)
+        ['identity_unavailable', 'image_unavailable', 'image_unsafe', 'image_invalid', 'image_failed',
+          'file_unavailable', 'file_invalid', 'file_failed'].includes(error.code as string)
         ? error.code as string : 'reply_failed');
     }).finally(() => {
       queue.active = undefined;
@@ -646,7 +648,26 @@ export class ChatBot {
 
   async uploadImage(svg: string, signal: AbortSignal): Promise<string> {
     if (!this.capabilities.has('media:upload')) throw failure('image_unavailable');
-    const png = renderSvg(svg);
+    return this.upload(renderSvg(svg), { 'content-type': 'image/png' }, 'image_failed', signal);
+  }
+
+  async uploadFile({ name, content }: { name: string; content: string }, signal: AbortSignal): Promise<string> {
+    if (!this.capabilities.has('media:upload')) throw failure('file_unavailable');
+    const format = /^[^/\\\x00-\x1f\x7f]{1,100}\.(txt|md|csv|pdf)$/i.exec(name)?.[1].toLowerCase();
+    // LINE.js accepts only UTF-8 text without control characters other than whitespace.
+    if (!format || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(content)) throw failure('file_invalid');
+    const headers = { 'x-file-name': encodeURIComponent(name) };
+    if (format !== 'pdf') {
+      return this.upload(Buffer.from(content), { ...headers, 'content-type': 'text/plain; charset=utf-8' }, 'file_failed', signal);
+    }
+    if (!this.config.pdfFont) throw failure('file_unavailable');
+    let pdf: Buffer<ArrayBuffer>;
+    try { pdf = await renderPdf(content, this.config.pdfFont); }
+    catch { throw failure('file_invalid'); }
+    return this.upload(pdf, { ...headers, 'content-type': 'application/pdf' }, 'file_failed', signal);
+  }
+
+  async upload(body: Buffer<ArrayBuffer>, headers: Record<string, string>, failureCode: string, signal: AbortSignal): Promise<string> {
     const url = new URL('/api/media/upload', this.config.line.url);
     url.protocol = url.protocol === 'wss:' ? 'https:' : 'http:';
     let result: unknown;
@@ -654,15 +675,15 @@ export class ChatBot {
       // Same Bearer as /api/ws; Node's fetch sends no Origin, which the endpoint requires.
       const response = await fetch(url, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${this.config.line.token}`, 'content-type': 'image/png' },
-        body: png,
+        headers: { ...headers, Authorization: `Bearer ${this.config.line.token}` },
+        body,
         signal: AbortSignal.any([signal, AbortSignal.timeout(REQUEST_TIMEOUT)]),
       });
       result = response.ok ? await response.json() : undefined;
     } catch {
       if (signal.aborted) throw failure('cancelled');
     }
-    if (!isRecord(result) || typeof result.mediaId !== 'string') throw failure('image_failed');
+    if (!isRecord(result) || typeof result.mediaId !== 'string') throw failure(failureCode);
     return result.mediaId;
   }
 
@@ -689,17 +710,20 @@ export class ChatBot {
     const result = await this.engine.prepare(message.channelId, input, signal,
       owner ? { followup: false, owner: true } : { followup: !direct });
     if (signal.aborted || !result) return;
-    // Render and upload while the text goes out; the upload ID stays valid for ten minutes.
-    const media = result.image === undefined ? undefined : this.uploadImage(result.image, signal);
-    media?.catch(() => {});
+    // Render and upload while the text goes out; upload IDs stay valid for ten minutes.
+    const media = [
+      result.image === undefined ? undefined : this.uploadImage(result.image, signal),
+      result.file === undefined ? undefined : this.uploadFile(result.file, signal),
+    ].filter(upload => upload !== undefined);
+    for (const upload of media) upload.catch(() => {});
     const chunks = result.text.trim() ? splitText(result.text, this.config.line.textMaxLength) : [];
     for (const text of chunks) {
       await this.rateLimit(signal);
       if (signal.aborted || !this.ready) return;
       await this.request('message:send', { chatId: message.channelId, text, replyTo: message.messageId }, 'sent', signal);
     }
-    if (media) {
-      const mediaId = await media;
+    for (const upload of media) {
+      const mediaId = await upload;
       await this.rateLimit(signal);
       if (signal.aborted || !this.ready) return;
       await this.request('message:send', { chatId: message.channelId, mediaId }, 'sent', signal);

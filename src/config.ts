@@ -1,8 +1,25 @@
-import { open, readFile } from 'node:fs/promises';
+import { access, open, readFile } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { dirname, extname, resolve } from 'node:path';
 import { parse } from 'yaml';
 import { isRecord } from './guards.js';
+
+export interface PdfFont {
+  file: string;
+  /** PostScript name; required for .ttc collections. */
+  name?: string;
+}
+
+// PDF's built-in fonts have no CJK glyphs, so a system CJK font must be embedded.
+const PDF_FONT_CANDIDATES: PdfFont[] = [
+  // Debian/Ubuntu fonts-noto-cjk, Arch noto-fonts-cjk, Fedora google-noto-sans-cjk-fonts.
+  ...[
+    '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
+    '/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc',
+    '/usr/share/fonts/google-noto-sans-cjk-fonts/NotoSansCJK-Regular.ttc',
+  ].map(file => ({ file, name: 'NotoSansCJKtc-Regular' })),
+  { file: '/System/Library/Fonts/Hiragino Sans GB.ttc', name: 'HiraginoSansGB-W3' },
+];
 
 export interface LineConfig {
   url: string;
@@ -27,6 +44,8 @@ export interface Config {
   line: LineConfig;
   claude: ClaudeConfig;
   personalityFile: string;
+  /** CJK font embedded into PDF attachments; PDFs are unavailable without one. */
+  pdfFont?: PdfFont;
 }
 
 export class ConfigError extends Error {
@@ -68,7 +87,7 @@ export async function loadConfig(filename = 'config.yaml'): Promise<{ config: Co
   }
 
   requireValue(isRecord(raw), '設定必須是鍵值物件。');
-  const { line, claude, personalityFile } = raw;
+  const { line, claude, personalityFile, pdfFont: rawPdfFont } = raw;
   requireValue(isRecord(line) && isRecord(claude), '缺少 line 或 claude 設定。');
   const { url: lineUrl, token, chats } = line;
   let url: URL;
@@ -113,10 +132,29 @@ export async function loadConfig(filename = 'config.yaml'): Promise<{ config: Co
   try { system = await readFile(resolve(dirname(path), personalityFile), 'utf8'); }
   catch { throw new ConfigError('無法讀取 personalityFile 指定的個性檔案。'); }
   requireValue(system.trim().length > 0, 'personalityFile 不能是空白檔案。');
+  const readable = (file: string) => access(file, constants.R_OK).then(() => true, () => false);
+  let pdfFont: PdfFont | undefined;
+  if (rawPdfFont !== undefined) {
+    const fontError = 'pdfFont 必須是 { file, name? }；file 為可讀取的字型檔，字型集合（.ttc／.otc）必須以 name 指定 PostScript 名稱。';
+    requireValue(isRecord(rawPdfFont) && typeof rawPdfFont.file === 'string' && rawPdfFont.file.trim().length > 0
+      && (rawPdfFont.name === undefined || (typeof rawPdfFont.name === 'string' && rawPdfFont.name.trim().length > 0))
+      && (rawPdfFont.name !== undefined || !['.ttc', '.otc'].includes(extname(rawPdfFont.file).toLowerCase())), fontError);
+    const file = resolve(dirname(path), rawPdfFont.file);
+    requireValue(await readable(file), fontError);
+    pdfFont = { file, ...(typeof rawPdfFont.name === 'string' ? { name: rawPdfFont.name } : {}) };
+  } else {
+    for (const candidate of PDF_FONT_CANDIDATES) {
+      if (await readable(candidate.file)) {
+        pdfFont = candidate;
+        break;
+      }
+    }
+  }
   const config: Config = {
     line: { url: lineUrl, token, chats, ownMemberIds, textMaxLength, sendsPerMinute, maxPendingPerChat, maxPendingTotal },
     claude: { apiKey, model, contextTokens, maxOutputTokens, timeoutMs },
     personalityFile,
+    ...(pdfFont ? { pdfFont } : {}),
   };
   return { config, system };
 }

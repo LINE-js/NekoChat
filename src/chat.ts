@@ -6,6 +6,8 @@ export interface PreparedTurn {
   text: string;
   /** Self-contained SVG source the bot renders and sends after the text. */
   image?: string;
+  /** Attachment the bot uploads after the text (and image); the name selects the format. */
+  file?: { name: string; content: string };
   commit(): void;
 }
 
@@ -119,10 +121,20 @@ const REPLY_TOOL = {
     type: 'object',
     properties: {
       shouldReply: { type: 'boolean' },
-      reply: { type: 'string', description: 'Natural chat reply when shouldReply is true; otherwise an empty string. May be empty when image is set.' },
+      reply: { type: 'string', description: 'Natural chat reply when shouldReply is true; otherwise an empty string. May be empty when image or file is set.' },
       image: {
         type: 'string',
         description: 'Only when asked to draw or create a picture: one complete, self-contained SVG document with a viewBox, rendered to PNG and sent to the chat. Keep it concise; use only inline shapes, gradients and generic font families; never <image>, <foreignObject>, scripts, external links or url() except #fragments. Omit otherwise.',
+      },
+      file: {
+        type: 'object',
+        description: 'Only when asked for a file or document: sent to the chat as an attachment. Omit otherwise.',
+        properties: {
+          name: { type: 'string', description: 'File name ending in .txt, .md, .csv or .pdf, without slashes.' },
+          content: { type: 'string', description: 'Complete UTF-8 file text. For .pdf, plain text without Markdown syntax; it is typeset onto A4 pages.' },
+        },
+        required: ['name', 'content'],
+        additionalProperties: false,
       },
     },
     required: ['shouldReply', 'reply'],
@@ -350,15 +362,19 @@ export class ChatEngine implements ChatEngineLike {
       const block: unknown = Array.isArray(content) ? content[0] : undefined;
       const decision: unknown = isRecord(block) ? block.input : undefined;
       const image: unknown = isRecord(decision) ? decision.image : undefined;
+      const file: unknown = isRecord(decision) ? decision.file : undefined;
       if (
         !isRecord(result) || result.stop_reason !== 'tool_use' ||
         !Array.isArray(content) || content.length !== 1 ||
         !isRecord(block) || block.type !== 'tool_use' || block.name !== REPLY_TOOL.name ||
         typeof block.id !== 'string' || !block.id.trim() ||
         !isRecord(decision) ||
-        Object.keys(decision).length !== (image === undefined ? 2 : 3) ||
+        Object.keys(decision).length !== 2 + Number(image !== undefined) + Number(file !== undefined) ||
         typeof decision.shouldReply !== 'boolean' || typeof decision.reply !== 'string' ||
         (image !== undefined && (typeof image !== 'string' || !image.trim() || !decision.shouldReply)) ||
+        (file !== undefined && (!isRecord(file) || Object.keys(file).length !== 2 ||
+          typeof file.name !== 'string' || typeof file.content !== 'string' || !file.content.trim() ||
+          !decision.shouldReply)) ||
         (!decision.shouldReply && decision.reply !== '')
       ) {
         throw new ChatError('INVALID_RESPONSE');
@@ -368,15 +384,17 @@ export class ChatEngine implements ChatEngineLike {
         return null;
       }
       const text = decision.reply;
-      if (!text.trim() && image === undefined) throw new ChatError('INVALID_RESPONSE');
-      // Retain only a marker: the SVG source would inflate every later request.
-      const completed: ChatMessage[] = [...messages, {
-        role: 'assistant', content: image === undefined ? text : `${text}\n（附上一張圖片）`.trim(),
-      }];
+      const attachment = isRecord(file) ? { name: file.name as string, content: file.content as string } : undefined;
+      if (!text.trim() && image === undefined && !attachment) throw new ChatError('INVALID_RESPONSE');
+      // Retain only markers: SVG source and file bodies would inflate every later request.
+      const retained = [text, image === undefined ? '' : '（附上一張圖片）', attachment ? `（附上檔案 ${attachment.name}）` : '']
+        .filter(Boolean).join('\n');
+      const completed: ChatMessage[] = [...messages, { role: 'assistant', content: retained }];
       let committed = false;
       return {
         text,
         ...(typeof image === 'string' ? { image } : {}),
+        ...(attachment ? { file: attachment } : {}),
         commit: () => {
           if (
             committed || signal?.aborted || this.#chats.get(chatId) !== state ||

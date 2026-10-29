@@ -93,3 +93,21 @@ test('queue limits accept inclusive boundaries and reject invalid values or orde
   await save();
   await assert.rejects(loadConfig(filename), /maxPendingPerChat.*maxPendingTotal/);
 });
+
+test('pdfFont resolves relative to the config and rejects unreadable files or unnamed collections', async t => {
+  const { directory, filename, config, save } = await fixture(t);
+  const raw: Record<string, unknown> = config;
+  await writeFile(join(directory, 'font.ttf'), 'x');
+  await writeFile(join(directory, 'fonts.ttc'), 'x');
+  raw.pdfFont = { file: 'font.ttf' };
+  await save();
+  assert.deepEqual((await loadConfig(filename)).config.pdfFont, { file: join(directory, 'font.ttf') });
+  raw.pdfFont = { file: 'fonts.ttc', name: 'Family-Regular' };
+  await save();
+  assert.deepEqual((await loadConfig(filename)).config.pdfFont, { file: join(directory, 'fonts.ttc'), name: 'Family-Regular' });
+  for (const value of [{ file: 'fonts.ttc' }, { file: 'missing.ttf' }, { file: 'font.ttf', name: '' }, 'font.ttf']) {
+    raw.pdfFont = value;
+    await save();
+    await assert.rejects(loadConfig(filename), /pdfFont/);
+  }
+});

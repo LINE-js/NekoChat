@@ -529,7 +529,7 @@ test('compression uses the UTF8 byte gate and skips payloads that would not shri
     callback();
   });
   const { engine, calls } = harness();
-  const input = '中'.repeat(1_300);
+  const input = '中'.repeat(1_000);
   await engine.prepare('chat', input);
   assert.equal(compressed, 2);
   for (const { options, body } of calls) {
@@ -877,4 +877,24 @@ test('image decisions return the SVG, retain only a marker and reject malformed 
     input = bad;
     await assert.rejects(engine.prepare('chat', 'bad'), hasCode('INVALID_RESPONSE'));
   }
+});
+
+test('file decisions return the attachment, retain a named marker and reject malformed files', async () => {
+  let input: Record<string, unknown> = { shouldReply: true, reply: '給你', image: '<svg/>', file: { name: 'a.md', content: '# 標題' } };
+  const { engine, generations } = harness({ generate: () => ({
+    stop_reason: 'tool_use', content: [{ type: 'tool_use', id: 'toolu_file', name: 'conversation_reply', input }],
+  }) });
+  const turn = requireTurn(await engine.prepare('chat', 'make'));
+  assert.deepEqual([turn.text, turn.image, turn.file], ['給你', '<svg/>', { name: 'a.md', content: '# 標題' }]);
+  turn.commit();
+  input = { shouldReply: true, reply: 'next' };
+  requireTurn(await engine.prepare('chat', 'again'));
+  assert.deepEqual(generations().at(-1)?.body.messages.map(message => message.content),
+    ['make', '給你\n（附上一張圖片）\n（附上檔案 a.md）', 'again']);
+  for (const file of [{ name: 'a.txt', content: ' ' }, { name: 'a.txt' }, { name: 1, content: 'x' }, { name: 'a.txt', content: 'x', extra: 1 }, 'a.txt']) {
+    input = { shouldReply: true, reply: '', file };
+    await assert.rejects(engine.prepare('chat', 'bad'), hasCode('INVALID_RESPONSE'));
+  }
+  input = { shouldReply: false, reply: '', file: { name: 'a.txt', content: 'x' } };
+  await assert.rejects(engine.prepare('chat', 'bad'), hasCode('INVALID_RESPONSE'));
 });
