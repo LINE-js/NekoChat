@@ -1,6 +1,6 @@
 import WebSocket from 'ws';
 import { randomUUID } from 'node:crypto';
-import type { LineConfig, PdfFont } from './config.js';
+import type { LineConfig, CjkFont } from './config.js';
 import type { ChatEngineLike } from './chat.js';
 import { isRecord } from './guards.js';
 import { renderSvg } from './image.js';
@@ -124,6 +124,21 @@ function failure(code: string): Error & { code: string } {
   return Object.assign(new Error(code), { code });
 }
 
+function codeOf(error: unknown): string | undefined {
+  return isRecord(error) && typeof error.code === 'string' ? error.code : undefined;
+}
+
+const MEDIA_NOTICES: Record<string, string> = {
+  image_unavailable: '目前無法傳送圖片。',
+  image_unsafe: '這張圖沒有畫成功，請換個說法再試一次。',
+  image_invalid: '這張圖沒有畫成功，請換個說法再試一次。',
+  image_failed: '圖片沒有送出成功，請稍後再試。',
+  file_unavailable: '目前無法傳送檔案。',
+  pdf_unavailable: '目前無法產生 PDF，可以改用 txt 或 md。',
+  file_invalid: '檔案格式有誤，沒有送出。',
+  file_failed: '檔案沒有送出成功，請稍後再試。',
+};
+
 function delay(ms: number, signal: AbortSignal): Promise<void> {
   if (signal.aborted) return Promise.reject(failure('cancelled'));
   return new Promise<void>((resolve, reject) => {
@@ -164,7 +179,7 @@ function splitText(text: string, maximum: number): string[] {
 }
 
 export class ChatBot {
-  config: { line: LineConfig; pdfFont?: PdfFont };
+  config: { line: LineConfig; cjkFont?: CjkFont };
   engine: ChatEngineLike;
   log: (code: string) => void;
   allowed: Set<string>;
@@ -196,7 +211,7 @@ export class ChatBot {
   userId: string | undefined;
   channels: Set<string> | undefined;
   constructor({ config, engine, log = () => {} }: {
-    config: { line: LineConfig; pdfFont?: PdfFont }; engine: ChatEngineLike; log?: (code: string) => void;
+    config: { line: LineConfig; cjkFont?: CjkFont }; engine: ChatEngineLike; log?: (code: string) => void;
   }) {
     this.config = config;
     this.engine = engine;
@@ -600,10 +615,7 @@ export class ChatBot {
     const controller = new AbortController();
     queue.active = controller;
     void this.reply(entry.message, controller.signal, entry.token).catch((error: unknown) => {
-      if (!controller.signal.aborted) this.log(error !== null && typeof error === 'object' && 'code' in error &&
-        ['identity_unavailable', 'image_unavailable', 'image_unsafe', 'image_invalid', 'image_failed',
-          'file_unavailable', 'file_invalid', 'file_failed'].includes(error.code as string)
-        ? error.code as string : 'reply_failed');
+      if (!controller.signal.aborted) this.log(codeOf(error) === 'identity_unavailable' ? 'identity_unavailable' : 'reply_failed');
     }).finally(() => {
       queue.active = undefined;
       // A cancelled owner must not release slots or remove a replacement queue.
@@ -651,7 +663,7 @@ export class ChatBot {
     let svg: string;
     try { svg = await draw(signal); }
     catch { throw failure(signal.aborted ? 'cancelled' : 'image_failed'); }
-    return this.upload(renderSvg(svg), { 'content-type': 'image/png' }, 'image_failed', signal);
+    return this.upload(renderSvg(svg, this.config.cjkFont), { 'content-type': 'image/png' }, 'image_failed', signal);
   }
 
   async uploadFile({ name, content }: { name: string; content: string }, signal: AbortSignal): Promise<string> {
@@ -663,9 +675,9 @@ export class ChatBot {
     if (format !== 'pdf') {
       return this.upload(Buffer.from(content), { ...headers, 'content-type': 'text/plain; charset=utf-8' }, 'file_failed', signal);
     }
-    if (!this.config.pdfFont) throw failure('file_unavailable');
+    if (!this.config.cjkFont) throw failure('pdf_unavailable');
     let pdf: Buffer<ArrayBuffer>;
-    try { pdf = await renderPdf(content, this.config.pdfFont); }
+    try { pdf = await renderPdf(content, this.config.cjkFont); }
     catch { throw failure('file_invalid'); }
     return this.upload(pdf, { ...headers, 'content-type': 'application/pdf' }, 'file_failed', signal);
   }
@@ -725,13 +737,25 @@ export class ChatBot {
       if (signal.aborted || !this.ready) return;
       await this.request('message:send', { chatId: message.channelId, text, replyTo: message.messageId }, 'sent', signal);
     }
+    // A missing picture or file is reported in the chat so the request does not look ignored.
+    let complete = true;
     for (const upload of media) {
-      const mediaId = await upload;
+      let payload: { chatId: string; mediaId: string } | { chatId: string; text: string; replyTo: string };
+      try {
+        payload = { chatId: message.channelId, mediaId: await upload };
+      } catch (error) {
+        if (signal.aborted) return;
+        const code = codeOf(error) ?? '';
+        if (!Object.hasOwn(MEDIA_NOTICES, code)) throw error;
+        this.log(code);
+        complete = false;
+        payload = { chatId: message.channelId, text: MEDIA_NOTICES[code], replyTo: message.messageId };
+      }
       await this.rateLimit(signal);
       if (signal.aborted || !this.ready) return;
-      await this.request('message:send', { chatId: message.channelId, mediaId }, 'sent', signal);
+      await this.request('message:send', payload, 'sent', signal);
     }
-    if (!signal.aborted && this.ready) {
+    if (complete && !signal.aborted && this.ready) {
       result.commit();
       this.engaged.add(message.channelId);
     }

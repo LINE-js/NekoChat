@@ -6,7 +6,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
 import type { TestContext } from 'node:test';
 import { createServer, type IncomingHttpHeaders } from 'node:http';
-import type { LineConfig, PdfFont } from '../src/config.js';
+import type { LineConfig, CjkFont } from '../src/config.js';
 import type { ChatEngineLike, PreparedTurn, PrepareOptions } from '../src/chat.js';
 import { isRecord } from '../src/guards.js';
 import { ChatBot, type LineMessage, type LineRequest } from '../src/bot.js';
@@ -23,7 +23,7 @@ interface FixtureOptions {
   line?: Partial<LineConfig>;
   handshake?: boolean;
   acknowledge?: boolean;
-  pdfFont?: PdfFont;
+  cjkFont?: CjkFont;
   history?: (request: Extract<LineRequest, { type: 'history:fetch' }>) => {
     messages: unknown[]; hasMore: boolean; cursor?: string; chatId?: string;
   } | null;
@@ -87,7 +87,7 @@ function message(id: string, overrides: Partial<LineMessage> = {}) {
   } };
 }
 
-async function fixture(t: TestContext, { prepare, line = {}, handshake = true, acknowledge = true, history, pdfFont }: FixtureOptions = {}) {
+async function fixture(t: TestContext, { prepare, line = {}, handshake = true, acknowledge = true, history, cjkFont }: FixtureOptions = {}) {
   const uploads: { headers: IncomingHttpHeaders; body: Buffer }[] = [];
   let uploadStatus = 200;
   const http = createServer(async (request, response) => {
@@ -136,7 +136,7 @@ async function fixture(t: TestContext, { prepare, line = {}, handshake = true, a
     url: `ws://127.0.0.1:${address.port}/api/ws`, token: 'local-test-token',
     chats: ['group', 'second', 'square'], ownMemberIds: {}, textMaxLength: 8000,
     sendsPerMinute: 240, maxPendingPerChat: 50, maxPendingTotal: 200, ...line,
-  }, ...(pdfFont ? { pdfFont } : {}) }, engine, log: code => logs.push(code) });
+  }, ...(cjkFont ? { cjkFont } : {}) }, engine, log: code => logs.push(code) });
   t.after(async () => {
     bot.stop();
     await bot.closed;
@@ -1390,9 +1390,15 @@ test('rejected or withdrawn admin tokens fall back to ordinary reply rules', asy
 
 const SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 10"><defs><linearGradient id="g"/></defs><rect width="20" height="10" fill="url(#g)"/></svg>';
 
+const SYSTEM_CJK_FONT = [
+  { file: '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc', name: 'NotoSansCJKtc-Regular' },
+  { file: '/System/Library/Fonts/Hiragino Sans GB.ttc', name: 'HiraginoSansGB-W3' },
+].find(font => existsSync(font.file));
+
 async function imageFixture(t: TestContext, image: (text: string) => string, drawn?: Promise<void>) {
   const commits: string[] = [];
-  const f = await fixture(t, { prepare: ({ chatId, input }) => {
+  // A configured font skips resvg's slow system font scan.
+  const f = await fixture(t, { cjkFont: SYSTEM_CJK_FONT, prepare: ({ chatId, input }) => {
     const { text } = inputJson(input);
     return {
       text: text === '@caption' ? '畫圖中' : '',
@@ -1429,7 +1435,7 @@ test('the acknowledgement is sent before drawing finishes, then the PNG is uploa
   await until(() => commits.length === 2);
 });
 
-test('failed drawing, unsafe SVGs, missing upload support and failed uploads send no image and skip the commit', async t => {
+test('failed drawing, unsafe SVGs, missing upload support and failed uploads are reported and skip the commit', async t => {
   const { f, commits } = await imageFixture(t, text => {
     if (text === '@broken') throw new Error('generation failed');
     return text === '@unsafe' ? '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 4 4"><image href="/etc/secret.png" width="4" height="4"/></svg>' : SVG;
@@ -1448,11 +1454,18 @@ test('failed drawing, unsafe SVGs, missing upload support and failed uploads sen
   assert.equal(f.uploads.length, 1);
   assert.equal(f.media.length, 0);
   assert.deepEqual(commits, []);
+  await until(() => f.sends.length === 4);
+  assert.deepEqual(f.sends.map(request => [request.text, request.replyTo]), [
+    ['目前無法傳送圖片。', 'unsupported'],
+    ['這張圖沒有畫成功，請換個說法再試一次。', 'unsafe'],
+    ['圖片沒有送出成功，請稍後再試。', 'broken'],
+    ['圖片沒有送出成功，請稍後再試。', 'failed'],
+  ]);
 });
 
-async function fileFixture(t: TestContext, file: (text: string) => { name: string; content: string }, pdfFont?: PdfFont) {
+async function fileFixture(t: TestContext, file: (text: string) => { name: string; content: string }, cjkFont?: CjkFont) {
   const commits: string[] = [];
-  const f = await fixture(t, { pdfFont, prepare: ({ chatId, input }) => ({
+  const f = await fixture(t, { cjkFont, prepare: ({ chatId, input }) => ({
     text: '', file: file(inputJson(input).text), commit: () => { commits.push(chatId); },
   }) });
   f.send({ type: 'hello', protocol: 2, capabilities: ['chat:admins', 'media:upload'] });
@@ -1473,7 +1486,7 @@ test('text attachments upload as UTF-8 with the encoded file name', async t => {
   ]);
 });
 
-test('invalid attachments and PDFs without a CJK font are refused before upload', async t => {
+test('invalid attachments and PDFs without a CJK font are reported instead of uploaded', async t => {
   const { f, commits } = await fileFixture(t, text => ({
     '@ext': { name: 'run.sh', content: 'x' },
     '@path': { name: '../a.txt', content: 'x' },
@@ -1484,15 +1497,16 @@ test('invalid attachments and PDFs without a CJK font are refused before upload'
     await until(() => f.logs.filter(code => code === 'file_invalid').length === ['ext', 'path', 'control'].indexOf(id) + 1);
   }
   f.send(message('pdf'));
-  await until(() => f.logs.includes('file_unavailable'));
+  await until(() => f.logs.includes('pdf_unavailable'));
   assert.equal(f.uploads.length, 0);
   assert.deepEqual(commits, []);
+  await until(() => f.sends.length === 4);
+  assert.deepEqual(f.sends.map(request => request.text), [
+    ...Array(3).fill('檔案格式有誤，沒有送出。'), '目前無法產生 PDF，可以改用 txt 或 md。',
+  ]);
 });
 
-const SYSTEM_CJK_FONT = [
-  { file: '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc', name: 'NotoSansCJKtc-Regular' },
-  { file: '/System/Library/Fonts/Hiragino Sans GB.ttc', name: 'HiraginoSansGB-W3' },
-].find(font => existsSync(font.file));
+
 
 test('PDF attachments are typeset with the configured font', { skip: !SYSTEM_CJK_FONT && 'no system CJK font' }, async t => {
   const { f, commits } = await fileFixture(t, () => ({ name: '說明.pdf', content: '語喵的文件\n第二行' }), SYSTEM_CJK_FONT);

@@ -22,7 +22,7 @@ if (!valid) {
     const { config, system } = await loadConfig(filename);
     if (check) {
       console.log(`本機設定與個性資料檢查通過；上下文上限 ${config.claude.contextTokens} tokens（含輸出預留）。尚未驗證外部服務。`);
-      console.log(config.pdfFont ? `PDF 字型：${config.pdfFont.file}` : '找不到 CJK 字型，PDF 附件停用；請安裝 Noto Sans CJK 或設定 pdfFont。');
+      console.log(config.cjkFont ? `CJK 字型：${config.cjkFont.file}` : '找不到 CJK 字型：PDF 附件停用，圖片中的文字可能無法顯示；請安裝 Noto Sans CJK 或設定 cjkFont。');
     } else {
       const engine = new ChatEngine({ claude: config.claude, system });
       bot = new ChatBot({ config, engine, log: code => console.log(`[NekoChat] ${code}`) });

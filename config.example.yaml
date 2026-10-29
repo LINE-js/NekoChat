@@ -18,8 +18,8 @@ claude:
 
 personalityFile: "personality.md"
 
-# PDF 附件需要嵌入 CJK 字型。省略時自動尋找系統的 Noto Sans CJK（Debian/Ubuntu：apt install fonts-noto-cjk）
+# PDF 附件與圖片中的文字需要 CJK 字型。省略時自動尋找系統的 Noto Sans CJK（Debian/Ubuntu：apt install fonts-noto-cjk）
 # 或 macOS 的 Hiragino Sans GB；都找不到時 PDF 停用。字型集合（.ttc／.otc）必須指定 PostScript 名稱。
-# pdfFont:
+# cjkFont:
 #   file: "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
 #   name: "NotoSansCJKtc-Regular"

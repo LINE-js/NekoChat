@@ -1,8 +1,8 @@
 import PDFDocument from 'pdfkit';
-import type { PdfFont } from './config.js';
+import type { CjkFont } from './config.js';
 
 /** Typesets plain text onto A4 pages; pdfkit wraps lines and breaks pages. */
-export function renderPdf(content: string, font: PdfFont): Promise<Buffer<ArrayBuffer>> {
+export function renderPdf(content: string, font: CjkFont): Promise<Buffer<ArrayBuffer>> {
   const { promise, resolve, reject } = Promise.withResolvers<Buffer<ArrayBuffer>>();
   const chunks: Buffer<ArrayBuffer>[] = [];
   try {
