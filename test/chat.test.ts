@@ -857,3 +857,24 @@ test('owner turns must reply while ordinary followups may stay silent', async ()
   await assert.rejects(engine.prepare('chat', 'owner again', undefined, { owner: true }), hasCode('INVALID_RESPONSE'));
   assert.equal(await engine.prepare('chat', 'member', undefined, { followup: true }), null);
 });
+
+test('image decisions return the SVG, retain only a marker and reject malformed images', async () => {
+  let input: Record<string, unknown> = { shouldReply: true, reply: '', image: '<svg/>' };
+  const { engine, generations } = harness({ generate: () => ({
+    stop_reason: 'tool_use', content: [{ type: 'tool_use', id: 'toolu_image', name: 'conversation_reply', input }],
+  }) });
+  const turn = requireTurn(await engine.prepare('chat', 'draw'));
+  assert.deepEqual([turn.text, turn.image], ['', '<svg/>']);
+  turn.commit();
+  input = { shouldReply: true, reply: 'next' };
+  requireTurn(await engine.prepare('chat', 'again'));
+  assert.deepEqual(generations().at(-1)?.body.messages.map(message => message.content), ['draw', '（附上一張圖片）', 'again']);
+  for (const bad of [
+    { shouldReply: false, reply: '', image: '<svg/>' },
+    { shouldReply: true, reply: 'x', image: ' ' },
+    { shouldReply: true, reply: 'x', image: 1 },
+  ]) {
+    input = bad;
+    await assert.rejects(engine.prepare('chat', 'bad'), hasCode('INVALID_RESPONSE'));
+  }
+});

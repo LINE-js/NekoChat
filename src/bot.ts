@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import type { LineConfig } from './config.js';
 import type { ChatEngineLike } from './chat.js';
 import { isRecord } from './guards.js';
+import { renderSvg } from './image.js';
 
 export interface LineMessage {
   channelId: string;
@@ -23,6 +24,7 @@ export type LineRequest =
   | { type: 'chat:admins:get'; requestId: string; chatId: string }
   | { type: 'history:fetch'; requestId: string; chatId: string; limit: number; before?: string }
   | { type: 'message:send'; requestId: string; chatId: string; text: string; replyTo: string }
+  | { type: 'message:send'; requestId: string; chatId: string; mediaId: string }
   | { type: 'chat:admin-token:consume'; requestId: string; chatId: string; token: string };
 
 export interface SentEvent {
@@ -597,8 +599,9 @@ export class ChatBot {
     const controller = new AbortController();
     queue.active = controller;
     void this.reply(entry.message, controller.signal, entry.token).catch((error: unknown) => {
-      if (!controller.signal.aborted) this.log(error !== null && typeof error === 'object' &&
-        'code' in error && error.code === 'identity_unavailable' ? 'identity_unavailable' : 'reply_failed');
+      if (!controller.signal.aborted) this.log(error !== null && typeof error === 'object' && 'code' in error &&
+        ['identity_unavailable', 'image_unavailable', 'image_unsafe', 'image_invalid', 'image_failed'].includes(error.code as string)
+        ? error.code as string : 'reply_failed');
     }).finally(() => {
       queue.active = undefined;
       // A cancelled owner must not release slots or remove a replacement queue.
@@ -641,6 +644,28 @@ export class ChatBot {
     }
   }
 
+  async uploadImage(svg: string, signal: AbortSignal): Promise<string> {
+    if (!this.capabilities.has('media:upload')) throw failure('image_unavailable');
+    const png = renderSvg(svg);
+    const url = new URL('/api/media/upload', this.config.line.url);
+    url.protocol = url.protocol === 'wss:' ? 'https:' : 'http:';
+    let result: unknown;
+    try {
+      // Same Bearer as /api/ws; Node's fetch sends no Origin, which the endpoint requires.
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${this.config.line.token}`, 'content-type': 'image/png' },
+        body: png,
+        signal: AbortSignal.any([signal, AbortSignal.timeout(REQUEST_TIMEOUT)]),
+      });
+      result = response.ok ? await response.json() : undefined;
+    } catch {
+      if (signal.aborted) throw failure('cancelled');
+    }
+    if (!isRecord(result) || typeof result.mediaId !== 'string') throw failure('image_failed');
+    return result.mediaId;
+  }
+
   async reply(message: LineMessage, signal: AbortSignal, token?: string): Promise<void> {
     if (signal.aborted || !this.ready) return;
     const ownId = await this.ownId(message, signal);
@@ -664,11 +689,20 @@ export class ChatBot {
     const result = await this.engine.prepare(message.channelId, input, signal,
       owner ? { followup: false, owner: true } : { followup: !direct });
     if (signal.aborted || !result) return;
-    const chunks = splitText(result.text, this.config.line.textMaxLength);
+    // Render and upload while the text goes out; the upload ID stays valid for ten minutes.
+    const media = result.image === undefined ? undefined : this.uploadImage(result.image, signal);
+    media?.catch(() => {});
+    const chunks = result.text.trim() ? splitText(result.text, this.config.line.textMaxLength) : [];
     for (const text of chunks) {
       await this.rateLimit(signal);
       if (signal.aborted || !this.ready) return;
       await this.request('message:send', { chatId: message.channelId, text, replyTo: message.messageId }, 'sent', signal);
+    }
+    if (media) {
+      const mediaId = await media;
+      await this.rateLimit(signal);
+      if (signal.aborted || !this.ready) return;
+      await this.request('message:send', { chatId: message.channelId, mediaId }, 'sent', signal);
     }
     if (!signal.aborted && this.ready) {
       result.commit();
@@ -720,7 +754,7 @@ export class ChatBot {
     ...[type, payload, expectedType, signal]:
       | [type: 'chat:admins:get', payload: { chatId: string }, expectedType: 'chat:admins', signal: AbortSignal]
       | [type: 'history:fetch', payload: { chatId: string; limit: number; before?: string }, expectedType: 'history', signal: AbortSignal]
-      | [type: 'message:send', payload: { chatId: string; text: string; replyTo: string }, expectedType: 'sent', signal: AbortSignal]
+      | [type: 'message:send', payload: { chatId: string; text: string; replyTo: string } | { chatId: string; mediaId: string }, expectedType: 'sent', signal: AbortSignal]
       | [type: 'chat:admin-token:consume', payload: { chatId: string; token: string }, expectedType: 'chat:admin-token:consumed', signal: AbortSignal]
   ): Promise<ResponseEvent> {
     if (signal.aborted) return Promise.reject(failure('cancelled'));

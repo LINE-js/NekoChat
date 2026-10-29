@@ -4,6 +4,8 @@ import { isRecord } from './guards.js';
 
 export interface PreparedTurn {
   text: string;
+  /** Self-contained SVG source the bot renders and sends after the text. */
+  image?: string;
   commit(): void;
 }
 
@@ -117,7 +119,11 @@ const REPLY_TOOL = {
     type: 'object',
     properties: {
       shouldReply: { type: 'boolean' },
-      reply: { type: 'string', description: 'Natural chat reply when shouldReply is true; otherwise an empty string.' },
+      reply: { type: 'string', description: 'Natural chat reply when shouldReply is true; otherwise an empty string. May be empty when image is set.' },
+      image: {
+        type: 'string',
+        description: 'Only when asked to draw or create a picture: one complete, self-contained SVG document with a viewBox, rendered to PNG and sent to the chat. Keep it concise; use only inline shapes, gradients and generic font families; never <image>, <foreignObject>, scripts, external links or url() except #fragments. Omit otherwise.',
+      },
     },
     required: ['shouldReply', 'reply'],
     additionalProperties: false,
@@ -343,14 +349,16 @@ export class ChatEngine implements ChatEngineLike {
       const content: unknown = isRecord(result) ? result.content : undefined;
       const block: unknown = Array.isArray(content) ? content[0] : undefined;
       const decision: unknown = isRecord(block) ? block.input : undefined;
+      const image: unknown = isRecord(decision) ? decision.image : undefined;
       if (
         !isRecord(result) || result.stop_reason !== 'tool_use' ||
         !Array.isArray(content) || content.length !== 1 ||
         !isRecord(block) || block.type !== 'tool_use' || block.name !== REPLY_TOOL.name ||
         typeof block.id !== 'string' || !block.id.trim() ||
         !isRecord(decision) ||
-        Object.keys(decision).length !== 2 ||
+        Object.keys(decision).length !== (image === undefined ? 2 : 3) ||
         typeof decision.shouldReply !== 'boolean' || typeof decision.reply !== 'string' ||
+        (image !== undefined && (typeof image !== 'string' || !image.trim() || !decision.shouldReply)) ||
         (!decision.shouldReply && decision.reply !== '')
       ) {
         throw new ChatError('INVALID_RESPONSE');
@@ -360,11 +368,15 @@ export class ChatEngine implements ChatEngineLike {
         return null;
       }
       const text = decision.reply;
-      if (!text.trim()) throw new ChatError('INVALID_RESPONSE');
-      const completed: ChatMessage[] = [...messages, { role: 'assistant', content: text }];
+      if (!text.trim() && image === undefined) throw new ChatError('INVALID_RESPONSE');
+      // Retain only a marker: the SVG source would inflate every later request.
+      const completed: ChatMessage[] = [...messages, {
+        role: 'assistant', content: image === undefined ? text : `${text}\n（附上一張圖片）`.trim(),
+      }];
       let committed = false;
       return {
         text,
+        ...(typeof image === 'string' ? { image } : {}),
         commit: () => {
           if (
             committed || signal?.aborted || this.#chats.get(chatId) !== state ||

@@ -4,7 +4,7 @@ import { once } from 'node:events';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
 import type { TestContext } from 'node:test';
-import type { IncomingHttpHeaders } from 'node:http';
+import { createServer, type IncomingHttpHeaders } from 'node:http';
 import type { LineConfig } from '../src/config.js';
 import type { ChatEngineLike, PreparedTurn, PrepareOptions } from '../src/chat.js';
 import { isRecord } from '../src/guards.js';
@@ -52,6 +52,11 @@ function requestFrame(data: RawData): LineRequest {
     return { type: value.type, requestId: value.requestId, chatId: value.chatId, token: value.token };
   }
   assert.equal(value.type, 'message:send');
+  if (typeof value.mediaId === 'string') {
+    assert.equal(value.text, undefined);
+    assert.equal(value.replyTo, undefined);
+    return { type: 'message:send', requestId: value.requestId, chatId: value.chatId, mediaId: value.mediaId };
+  }
   assert.ok(typeof value.text === 'string' && typeof value.replyTo === 'string');
   return { type: 'message:send', requestId: value.requestId, chatId: value.chatId, text: value.text, replyTo: value.replyTo };
 }
@@ -81,8 +86,19 @@ function message(id: string, overrides: Partial<LineMessage> = {}) {
 }
 
 async function fixture(t: TestContext, { prepare, line = {}, handshake = true, acknowledge = true, history }: FixtureOptions = {}) {
-  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
-  await once(server, 'listening');
+  const uploads: { headers: IncomingHttpHeaders; body: Buffer }[] = [];
+  let uploadStatus = 200;
+  const http = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(chunk as Buffer);
+    uploads.push({ headers: request.headers, body: Buffer.concat(chunks) });
+    response.writeHead(request.method === 'POST' && request.url === '/api/media/upload' ? uploadStatus : 404,
+      { 'content-type': 'application/json' });
+    response.end(JSON.stringify(uploadStatus === 200 ? { mediaId: `upload-${uploads.length}` } : { code: 'RATE_LIMITED' }));
+  });
+  const server = new WebSocketServer({ server: http });
+  http.listen(0, '127.0.0.1');
+  await once(http, 'listening');
   const calls: PrepareCall[] = [], commits: string[] = [], cleared: string[] = [], requests: LineRequest[] = [], logs: string[] = [];
   let clearAll = 0;
   const engine: ChatEngineLike = {
@@ -112,7 +128,7 @@ async function fixture(t: TestContext, { prepare, line = {}, handshake = true, a
     });
     resolve(socket);
   }));
-  const address = server.address();
+  const address = http.address();
   assert.ok(address && typeof address === 'object');
   const bot = new ChatBot({ config: { line: {
     url: `ws://127.0.0.1:${address.port}/api/ws`, token: 'local-test-token',
@@ -124,6 +140,8 @@ async function fixture(t: TestContext, { prepare, line = {}, handshake = true, a
     await bot.closed;
     for (const socket of server.clients) socket.terminate();
     await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    http.closeAllConnections();
+    await new Promise<void>((resolve, reject) => http.close(error => error ? reject(error) : resolve()));
   });
   bot.start();
   const socket = await connected;
@@ -135,9 +153,11 @@ async function fixture(t: TestContext, { prepare, line = {}, handshake = true, a
   };
   if (handshake) await ready();
   return {
-    bot, server, socket, send, ready, calls, commits, cleared, requests, logs, headers,
+    bot, server, socket, send, ready, calls, commits, cleared, requests, logs, headers, uploads,
     get clearAll() { return clearAll; },
-    get sends() { return requests.filter((event): event is Extract<LineRequest, { type: 'message:send' }> => event.type === 'message:send'); },
+    failUploads() { uploadStatus = 429; },
+    get sends() { return requests.filter((event): event is Extract<LineRequest, { type: 'message:send'; text: string }> => event.type === 'message:send' && 'text' in event); },
+    get media() { return requests.filter((event): event is Extract<LineRequest, { mediaId: string }> => 'mediaId' in event); },
   };
 }
 
@@ -1364,4 +1384,51 @@ test('rejected or withdrawn admin tokens fall back to ordinary reply rules', asy
   f.send(message('after-change', { mentions: [], text: ADMIN_TOKEN }));
   await sleep(20);
   assert.equal(f.requests.filter(request => request.type === 'chat:admin-token:consume').length, 2);
+});
+
+const SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 10"><defs><linearGradient id="g"/></defs><rect width="20" height="10" fill="url(#g)"/></svg>';
+
+async function imageFixture(t: TestContext, image: (text: string) => string) {
+  const commits: string[] = [];
+  const f = await fixture(t, { prepare: ({ chatId, input }) => {
+    const { text } = inputJson(input);
+    return { text: text === '@caption' ? '畫好了' : '', image: image(text), commit: () => { commits.push(chatId); } };
+  } });
+  return { f, commits };
+}
+
+test('drawn SVGs are uploaded as PNG with the bot token and sent after the caption', async t => {
+  const { f, commits } = await imageFixture(t, () => SVG);
+  f.send({ type: 'hello', protocol: 2, capabilities: ['chat:admins', 'media:upload'] });
+  f.send(message('caption'));
+  await until(() => commits.length === 1);
+  assert.deepEqual(f.requests.filter(request => request.type === 'message:send').map(request => 'text' in request ? request.text : request.mediaId),
+    ['畫好了', 'upload-1']);
+  const [upload] = f.uploads;
+  assert.equal(upload.headers.authorization, 'Bearer local-test-token');
+  assert.equal(upload.headers['content-type'], 'image/png');
+  assert.equal(upload.headers.origin, undefined);
+  assert.deepEqual([...upload.body.subarray(1, 4)], [...Buffer.from('PNG')]);
+  // The longer side is scaled to 1024 px (IHDR width, height).
+  assert.deepEqual([upload.body.readUInt32BE(16), upload.body.readUInt32BE(20)], [1024, 512]);
+  // An image-only turn sends no empty text.
+  f.send(message('silent'));
+  await until(() => f.media.length === 2);
+  assert.equal(f.sends.length, 1);
+  await until(() => commits.length === 2);
+});
+
+test('unsafe SVGs, missing upload support and failed uploads send no image and skip the commit', async t => {
+  const { f, commits } = await imageFixture(t, text => text === '@unsafe' ? '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 4 4"><image href="/etc/secret.png" width="4" height="4"/></svg>' : SVG);
+  f.send(message('unsupported'));
+  await until(() => f.logs.includes('image_unavailable'));
+  f.send({ type: 'hello', protocol: 2, capabilities: ['chat:admins', 'media:upload'] });
+  f.send(message('unsafe'));
+  await until(() => f.logs.includes('image_unsafe'));
+  f.failUploads();
+  f.send(message('failed'));
+  await until(() => f.logs.includes('image_failed'));
+  assert.equal(f.uploads.length, 1);
+  assert.equal(f.media.length, 0);
+  assert.deepEqual(commits, []);
 });
