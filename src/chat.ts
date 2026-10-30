@@ -75,6 +75,8 @@ const OPENAI_API = 'https://api.openai.com/v1';
 const EPHEMERAL = { type: 'ephemeral' } as const;
 const MAX_CONTEXT_TOKENS = 100_000;
 const COMPRESS_MIN_BYTES = 4096;
+// Byte-level tokenizers spend at least one UTF-8 byte per token; this covers the prompt template the JSON body omits.
+const TEMPLATE_TOKENS = 2048;
 
 function compress(json: string, signal: AbortSignal): Promise<Buffer<ArrayBuffer>> {
   signal.throwIfAborted();
@@ -516,7 +518,9 @@ export class ChatEngine implements ChatEngineLike {
 
       const inputLimit = backend.config.contextTokens - backend.config.maxOutputTokens;
       let messages = messagesAfter(0);
-      const fullTokens = await count(messages);
+      const { body: fullBody } = this.#toolRequest(backend, instruction, REPLY_TOOL, messages, false, true);
+      // A body that fits even at one token per byte needs no count round trip before the decision.
+      const fullTokens = Buffer.byteLength(JSON.stringify(fullBody)) + TEMPLATE_TOKENS <= inputLimit ? 0 : await count(messages);
       if (fullTokens > inputLimit) {
         if (pairCount === 0) throw new ChatError('CONTEXT_TOO_LARGE');
         messages = messagesAfter(1);
@@ -569,7 +573,7 @@ export class ChatEngine implements ChatEngineLike {
     if (signal.aborted) throw new ChatError('ABORTED');
     const { request, dispose } = this.#session(backend, backend.config.timeoutMs, signal);
     try {
-      // Reuses the counted decision context: each follow-up tool is smaller than the decision tool.
+      // Reuses the decision context that fit: each follow-up tool is smaller than the decision tool.
       const { url, body } = this.#toolRequest(backend, instruction, tool, messages, true, false);
       const value = toolInput(backend, await request(url, body, 'GENERATION_FAILED'), tool.name)[field];
       if (typeof value !== 'string' || !value.trim()) throw new ChatError('INVALID_RESPONSE');

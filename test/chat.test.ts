@@ -725,10 +725,9 @@ test('followup trimming retains minimal evidence or stays silent without changin
   }
 });
 
-test('followup counts include identical decision system, tools and choice at the 100K boundary', async () => {
+test('followup counts include identical decision system, tools and choice at the input boundary', async () => {
   const { engine, calls, generations } = followupHarness({
-    config: { contextTokens: 100_000, maxOutputTokens: 1_000 },
-    count: (body) => !isSeedTurn(body) ? 99_000 : 20,
+    count: (body) => !isSeedTurn(body) ? 90 : 20,
   });
   requireTurn((await engine.prepare('chat', 'first'))).commit();
   await engine.prepare('chat', 'followup', undefined, { followup: true });
@@ -737,14 +736,13 @@ test('followup counts include identical decision system, tools and choice at the
   assert.ok(generated);
   assert.ok(counted);
   const { max_tokens, cache_control, ...input } = generated;
-  assert.equal(max_tokens, 1_000);
+  assert.equal(max_tokens, 10);
   assert.deepEqual(counted, input);
 });
 
 test('oversized followup decision overhead never generates and preserves prior history', async () => {
   const { engine, calls, generations } = followupHarness({
-    config: { contextTokens: 100_000, maxOutputTokens: 1_000 },
-    count: (body) => !isSeedTurn(body) ? 99_001 : 20,
+    count: (body) => !isSeedTurn(body) ? 91 : 20,
   });
   requireTurn((await engine.prepare('chat', 'first'))).commit();
   await assert.rejects(
@@ -758,6 +756,19 @@ test('oversized followup decision overhead never generates and preserves prior h
   assert.deepEqual(counts[0].body.tool_choice, counts[1].body.tool_choice);
   await engine.prepare('chat', 'direct');
   assert.equal(generations().at(-1)?.body.messages[0].content, 'first');
+});
+
+test('decisions skip the count request only when the body fits at one token per byte', async () => {
+  const { engine, calls, generations } = harness({
+    config: { contextTokens: 100_000, maxOutputTokens: 1_000 },
+    count: () => 1_000_000,
+  });
+  requireTurn(await engine.prepare('chat', 'hello')).commit();
+  assert.deepEqual(calls.map(call => new URL(call.url).pathname), ['/v1/messages']);
+  calls.length = 0;
+  await assert.rejects(engine.prepare('chat', '貓'.repeat(32_000)), hasCode('CONTEXT_TOO_LARGE'));
+  assert.deepEqual(calls.map(call => new URL(call.url).pathname), ['/v1/messages/count_tokens', '/v1/messages/count_tokens']);
+  assert.equal(generations().length, 0);
 });
 
 test('malformed decisions fail closed and never enter history for either trigger mode', async () => {
