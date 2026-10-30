@@ -60,6 +60,8 @@ export interface ChatMessage {
 interface ChatState {
   messages: ChatMessage[];
   revision: number;
+  /** The latest decision input a provider counted as fitting; later turns only append to it. */
+  counted?: { backend: Backend['name']; instruction: string; messages: ChatMessage[]; tokens: number };
 }
 
 type Backend = ({ name: 'claude'; config: ClaudeConfig } | { name: 'openai'; config: OpenAIConfig }) & {
@@ -458,7 +460,7 @@ export class ChatEngine implements ChatEngineLike {
     return this.#fallback(order, async (backend, chain) => {
       let decided;
       try {
-        decided = await this.#decide(backend, instruction, history, user, followup, signal);
+        decided = await this.#decide(backend, instruction, chat, history, user, followup, signal);
       } catch (error) {
         if (error instanceof ChatError && (error.code === 'TIMEOUT' ||
           ((error.code === 'COUNT_FAILED' || error.code === 'GENERATION_FAILED') &&
@@ -528,10 +530,11 @@ export class ChatEngine implements ChatEngineLike {
 
   /** Counts, trims the oldest history to fit this provider's budget and asks for the decision. */
   async #decide(
-    backend: Backend, instruction: string, history: ChatMessage[], user: ChatMessage, followup: boolean, signal?: AbortSignal,
+    backend: Backend, instruction: string, chat: ChatState, history: ChatMessage[], user: ChatMessage, followup: boolean, signal?: AbortSignal,
   ): Promise<{ messages: ChatMessage[]; decision: Record<string, unknown> } | null> {
     const { request, dispose } = this.#session(backend, backend.config.timeoutMs, signal);
     try {
+      const inputLimit = backend.config.contextTokens - backend.config.maxOutputTokens;
       const pairCount = history.length / 2;
       const messagesAfter = (droppedPairs: number): ChatMessage[] => [...history.slice(droppedPairs * 2), user];
       const count = async (messages: ChatMessage[]): Promise<number> => {
@@ -540,14 +543,24 @@ export class ChatEngine implements ChatEngineLike {
         if (!isRecord(result) || typeof result.input_tokens !== 'number' || !Number.isSafeInteger(result.input_tokens) || result.input_tokens < 0) {
           throw new ChatError('COUNT_FAILED');
         }
+        // The last fitting candidate counted is always the one kept below.
+        if (result.input_tokens <= inputLimit) chat.counted = { backend: backend.name, instruction, messages, tokens: result.input_tokens };
         return result.input_tokens;
       };
 
-      const inputLimit = backend.config.contextTokens - backend.config.maxOutputTokens;
       let messages = messagesAfter(0);
       const { body: fullBody } = this.#toolRequest(backend, instruction, REPLY_TOOL, messages, false, true);
-      // A body that fits even at one token per byte needs no count round trip before the decision.
-      const fullTokens = Buffer.byteLength(JSON.stringify(fullBody)) + TEMPLATE_TOKENS <= inputLimit ? 0 : await count(messages);
+      // Byte-level tokenizers spend at least one byte per token, so bytes bound the tokens of any text:
+      // the whole body, or what was appended to an input this provider already counted.
+      let bound = Buffer.byteLength(JSON.stringify(fullBody));
+      const base = chat.counted;
+      if (base?.backend === backend.name && base.messages.length <= messages.length &&
+          base.messages.every((message, index) => message === messages[index])) {
+        const added = Buffer.byteLength(JSON.stringify(messages.slice(base.messages.length))) +
+          (base.instruction === instruction ? 0 : Buffer.byteLength(instruction));
+        bound = Math.min(bound, base.tokens + added);
+      }
+      const fullTokens = bound + TEMPLATE_TOKENS <= inputLimit ? 0 : await count(messages);
       if (fullTokens > inputLimit) {
         if (pairCount === 0) throw new ChatError('CONTEXT_TOO_LARGE');
         messages = messagesAfter(1);

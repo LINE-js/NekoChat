@@ -771,6 +771,27 @@ test('decisions skip the count request only when the body fits at one token per 
   assert.equal(generations().length, 0);
 });
 
+test('later turns skip the count while appended bytes keep the last official count under the limit', async () => {
+  const { engine, calls } = harness({
+    config: { contextTokens: 100_000, maxOutputTokens: 1_000 },
+    count: () => 40_000,
+    generate: () => followupResult(true, 'ok'),
+  });
+  const paths = () => calls.splice(0).map(call => new URL(call.url).pathname);
+  requireTurn(await engine.prepare('chat', '貓'.repeat(32_000))).commit();
+  assert.deepEqual(paths(), ['/v1/messages/count_tokens', '/v1/messages']);
+  // 40K counted tokens plus the newly appended exchange stays far below the limit, even with another instruction.
+  requireTurn(await engine.prepare('chat', 'hello')).commit();
+  requireTurn(await engine.prepare('chat', 'and you?', undefined, { followup: true })).commit();
+  assert.deepEqual(paths(), ['/v1/messages', '/v1/messages']);
+  // Appending 60K bytes could exceed it, so the provider counts again.
+  await engine.prepare('chat', '貓'.repeat(20_000));
+  assert.deepEqual(paths(), ['/v1/messages/count_tokens', '/v1/messages']);
+  engine.clear('chat');
+  await engine.prepare('chat', '貓'.repeat(32_000));
+  assert.deepEqual(paths(), ['/v1/messages/count_tokens', '/v1/messages']);
+});
+
 test('malformed decisions fail closed and never enter history for either trigger mode', async () => {
   const valid = followupResult(true, 'reply');
   const block = valid.content[0];
