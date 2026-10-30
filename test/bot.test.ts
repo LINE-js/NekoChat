@@ -1463,46 +1463,63 @@ test('failed drawing, unsafe SVGs, missing upload support and failed uploads are
   ]);
 });
 
-async function fileFixture(t: TestContext, file: (text: string) => { name: string; content: string }, cjkFont?: CjkFont) {
-  const commits: string[] = [];
-  const f = await fixture(t, { cjkFont, prepare: ({ chatId, input }) => ({
-    text: '', file: file(inputJson(input).text), commit: () => { commits.push(chatId); },
-  }) });
+async function fileFixture(t: TestContext, file: (text: string) => { name: string; content: string }, cjkFont?: CjkFont, written?: Promise<void>) {
+  const commits: string[] = [], writes: string[] = [];
+  const f = await fixture(t, { cjkFont, prepare: ({ chatId, input }) => {
+    const { name, content } = file(inputJson(input).text);
+    return {
+      text: '準備中',
+      file: { name, write: async () => {
+        writes.push(name);
+        await written;
+        if (content === '@fail') throw new Error('generation failed');
+        return content;
+      } },
+      commit: () => { commits.push(chatId); },
+    };
+  } });
   f.send({ type: 'hello', protocol: 2, capabilities: ['chat:admins', 'media:upload'] });
-  return { f, commits };
+  return { f, commits, writes };
 }
 
-test('text attachments upload as UTF-8 with the encoded file name', async t => {
-  const { f, commits } = await fileFixture(t, text => ({ name: text === '@csv' ? '報表 1.csv' : 'notes.MD', content: '名稱,數量\n貓,1\t\r\n' }));
+test('the acknowledgement precedes writing, then text attachments upload as UTF-8 with the encoded name', async t => {
+  const finish = Promise.withResolvers<void>();
+  const { f, commits } = await fileFixture(t, text => ({ name: text === '@csv' ? '報表 1.csv' : 'notes.MD', content: '名稱,數量\n貓,1\t\r\n' }), undefined, finish.promise);
   f.send(message('csv'));
+  await until(() => f.sends.length === 1);
+  await sleep(20);
+  assert.deepEqual([f.sends[0].text, f.uploads.length, commits.length], ['準備中', 0, 0]);
+  finish.resolve();
   await until(() => commits.length === 1);
   f.send(message('md'));
   await until(() => commits.length === 2);
-  assert.deepEqual(f.media.map(request => request.mediaId), ['upload-1', 'upload-2']);
-  assert.equal(f.sends.length, 0);
+  assert.deepEqual(f.requests.filter(request => request.type === 'message:send').map(request => 'text' in request ? request.text : request.mediaId),
+    ['準備中', 'upload-1', '準備中', 'upload-2']);
   assert.deepEqual(f.uploads.map(upload => [upload.headers['x-file-name'], upload.headers['content-type'], upload.body.toString()]), [
     [encodeURIComponent('報表 1.csv'), 'text/plain; charset=utf-8', '名稱,數量\n貓,1\t\r\n'],
     ['notes.MD', 'text/plain; charset=utf-8', '名稱,數量\n貓,1\t\r\n'],
   ]);
 });
 
-test('invalid attachments and PDFs without a CJK font are reported instead of uploaded', async t => {
-  const { f, commits } = await fileFixture(t, text => ({
+test('invalid, failed and font-less attachments are reported instead of uploaded', async t => {
+  const { f, commits, writes } = await fileFixture(t, text => ({
     '@ext': { name: 'run.sh', content: 'x' },
     '@path': { name: '../a.txt', content: 'x' },
     '@control': { name: 'a.txt', content: 'a\u0000b' },
+    '@fail': { name: 'b.txt', content: '@fail' },
   }[text] ?? { name: 'a.pdf', content: 'x' }));
-  for (const id of ['ext', 'path', 'control']) {
+  for (const id of ['ext', 'path', 'control', 'fail', 'pdf']) {
     f.send(message(id));
-    await until(() => f.logs.filter(code => code === 'file_invalid').length === ['ext', 'path', 'control'].indexOf(id) + 1);
+    await until(() => f.sends.length === 2 * (['ext', 'path', 'control', 'fail', 'pdf'].indexOf(id) + 1));
   }
-  f.send(message('pdf'));
-  await until(() => f.logs.includes('pdf_unavailable'));
   assert.equal(f.uploads.length, 0);
   assert.deepEqual(commits, []);
-  await until(() => f.sends.length === 4);
-  assert.deepEqual(f.sends.map(request => request.text), [
-    ...Array(3).fill('檔案格式有誤，沒有送出。'), '目前無法產生 PDF，可以改用 txt 或 md。',
+  // Bad names and a missing PDF font are refused before paying for the body.
+  assert.deepEqual(writes, ['a.txt', 'b.txt']);
+  assert.deepEqual(f.logs.filter(code => code.startsWith('file') || code.startsWith('pdf')),
+    ['file_invalid', 'file_invalid', 'file_invalid', 'file_write_failed', 'pdf_unavailable']);
+  assert.deepEqual(f.sends.filter((_, index) => index % 2).map(request => request.text), [
+    ...Array(3).fill('檔案格式有誤，沒有送出。'), '檔案沒有寫成功，請稍後再試。', '目前無法產生 PDF，可以改用 txt 或 md。',
   ]);
 });
 

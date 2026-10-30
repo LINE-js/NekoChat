@@ -6,8 +6,8 @@ export interface PreparedTurn {
   text: string;
   /** Generates the requested picture as SVG; called after the acknowledging text is sent. */
   draw?: (signal: AbortSignal) => Promise<string>;
-  /** Attachment the bot uploads after the text (and image); the name selects the format. */
-  file?: { name: string; content: string };
+  /** Attachment the bot uploads after the text (and image); the name selects the format and write() produces the body. */
+  file?: { name: string; write: (signal: AbortSignal) => Promise<string> };
   commit(): void;
 }
 
@@ -121,19 +121,19 @@ const REPLY_TOOL = {
     type: 'object',
     properties: {
       shouldReply: { type: 'boolean' },
-      reply: { type: 'string', description: 'Natural chat reply when shouldReply is true; otherwise an empty string. May be empty when file is set.' },
+      reply: { type: 'string', description: 'Natural chat reply when shouldReply is true; otherwise an empty string.' },
       draw: {
         type: 'string',
         description: 'Only when asked to draw or create a picture: a concise description of the picture. It is drawn after your reply is sent, so reply must briefly acknowledge that you are starting to draw and must not claim it is finished. Omit otherwise.',
       },
       file: {
         type: 'object',
-        description: 'Only when asked for a file or document: sent to the chat as an attachment. Omit otherwise.',
+        description: 'Only when asked for a file or document. It is written after your reply is sent and then attached, so reply must briefly acknowledge that you are preparing the file and must not claim it is finished. Omit otherwise.',
         properties: {
           name: { type: 'string', description: 'File name ending in .txt, .md, .csv or .pdf, without slashes.' },
-          content: { type: 'string', description: 'Complete UTF-8 file text. For .pdf, plain text without Markdown syntax; it is typeset onto A4 pages.' },
+          description: { type: 'string', description: 'Concise description of what the file must contain.' },
         },
-        required: ['name', 'content'],
+        required: ['name', 'description'],
         additionalProperties: false,
       },
     },
@@ -170,6 +170,27 @@ const DRAW_SYSTEM = `
 You already told the member you are drawing. Draw the picture requested in the latest message,
 as described below, in your usual style. Call draw_svg exactly once; it is rendered to PNG and sent.
 Description:`;
+
+const WRITE_TOOL = {
+  name: 'write_file',
+  description: 'Return the finished file body; this performs no external action.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      content: { type: 'string', description: 'Complete UTF-8 file text.' },
+    },
+    required: ['content'],
+    additionalProperties: false,
+  },
+};
+const WRITE_CHOICE = { type: 'tool', name: WRITE_TOOL.name, disable_parallel_tool_use: true };
+const writeSystem = (name: string, description: string) => `
+You already told the member you are preparing a file. Write the complete body of ${JSON.stringify(name)}
+requested in the latest message, as described below. ${name.toLowerCase().endsWith('.pdf')
+  ? 'It is typeset as plain text onto A4 pages, so do not use Markdown syntax.'
+  : 'It is sent exactly as written.'} Call write_file exactly once.
+Description:
+${description}`;
 
 const DECISION_SYSTEM = `
 Be engaged and warm in exchanges clearly addressed to you, without forced jokes,
@@ -403,7 +424,7 @@ export class ChatEngine implements ChatEngineLike {
         typeof decision.shouldReply !== 'boolean' || typeof decision.reply !== 'string' ||
         (draw !== undefined && (typeof draw !== 'string' || !draw.trim() || !decision.shouldReply)) ||
         (file !== undefined && (!isRecord(file) || Object.keys(file).length !== 2 ||
-          typeof file.name !== 'string' || typeof file.content !== 'string' || !file.content.trim() ||
+          typeof file.name !== 'string' || typeof file.description !== 'string' || !file.description.trim() ||
           !decision.shouldReply)) ||
         (!decision.shouldReply && decision.reply !== '')
       ) {
@@ -413,19 +434,27 @@ export class ChatEngine implements ChatEngineLike {
         if (owner) throw new ChatError('INVALID_RESPONSE');
         return null;
       }
-      // Drawing takes a while; members must see an acknowledgement before the picture arrives.
-      const text = typeof draw === 'string' && !decision.reply.trim() ? '收到，正在畫圖，請稍等。' : decision.reply;
-      const attachment = isRecord(file) ? { name: file.name as string, content: file.content as string } : undefined;
-      if (!text.trim() && !attachment) throw new ChatError('INVALID_RESPONSE');
+      const name = isRecord(file) && typeof file.name === 'string' ? file.name : undefined;
+      const brief = isRecord(file) && typeof file.description === 'string' ? file.description : '';
+      // Pictures and files take a while; members must see an acknowledgement before they arrive.
+      const text = decision.reply.trim() ? decision.reply
+        : name !== undefined ? '收到，正在準備檔案，請稍等。'
+        : typeof draw === 'string' ? '收到，正在畫圖，請稍等。' : '';
+      if (!text) throw new ChatError('INVALID_RESPONSE');
       // Retain only markers: SVG source and file bodies would inflate every later request.
-      const retained = [text, draw === undefined ? '' : '（附上一張圖片）', attachment ? `（附上檔案 ${attachment.name}）` : '']
+      const retained = [text, draw === undefined ? '' : '（附上一張圖片）', name === undefined ? '' : `（附上檔案 ${name}）`]
         .filter(Boolean).join('\n');
       const completed: ChatMessage[] = [...messages, { role: 'assistant', content: retained }];
       let committed = false;
       return {
         text,
-        ...(typeof draw === 'string' ? { draw: (drawSignal: AbortSignal) => this.#draw(draw, messages, drawSignal) } : {}),
-        ...(attachment ? { file: attachment } : {}),
+        ...(typeof draw === 'string' ? {
+          draw: (drawSignal: AbortSignal) => this.#produce(`${DRAW_SYSTEM}\n${draw}`, DRAW_TOOL, DRAW_CHOICE, 'svg', messages, drawSignal),
+        } : {}),
+        ...(name !== undefined ? { file: {
+          name,
+          write: (writeSignal: AbortSignal) => this.#produce(writeSystem(name, brief), WRITE_TOOL, WRITE_CHOICE, 'content', messages, writeSignal),
+        } } : {}),
         commit: () => {
           if (
             committed || signal?.aborted || this.#chats.get(chatId) !== state ||
@@ -441,25 +470,28 @@ export class ChatEngine implements ChatEngineLike {
     }
   }
 
-  async #draw(description: string, messages: ChatMessage[], signal: AbortSignal): Promise<string> {
+  /** Runs a follow-up request that must return one string field of a forced tool. */
+  async #produce(
+    instruction: string, tool: { name: string }, choice: unknown, field: string, messages: ChatMessage[], signal: AbortSignal,
+  ): Promise<string> {
     if (signal.aborted) throw new ChatError('ABORTED');
     const { request, dispose } = this.#session(signal);
     try {
-      // Reuses the counted decision context: the draw tool is smaller than the decision tool.
+      // Reuses the counted decision context: each follow-up tool is smaller than the decision tool.
       const result = await request('messages', {
         model: this.#claude.model,
-        system: [...this.#system, { type: 'text', text: `${DRAW_SYSTEM}\n${description}` }],
-        tools: [DRAW_TOOL], tool_choice: DRAW_CHOICE,
+        system: [...this.#system, { type: 'text', text: instruction }],
+        tools: [tool], tool_choice: choice,
         messages,
         max_tokens: this.#claude.maxOutputTokens,
       }, 'GENERATION_FAILED');
       if (isRecord(result) && result.stop_reason === 'max_tokens') throw new ChatError('OUTPUT_TRUNCATED');
       const content: unknown = isRecord(result) ? result.content : undefined;
       const block: unknown = Array.isArray(content) && content.length === 1 ? content[0] : undefined;
-      const svg: unknown = isRecord(block) && block.type === 'tool_use' && block.name === DRAW_TOOL.name && isRecord(block.input)
-        ? block.input.svg : undefined;
-      if (typeof svg !== 'string' || !svg.trim()) throw new ChatError('INVALID_RESPONSE');
-      return svg;
+      const value: unknown = isRecord(block) && block.type === 'tool_use' && block.name === tool.name && isRecord(block.input)
+        ? block.input[field] : undefined;
+      if (typeof value !== 'string' || !value.trim()) throw new ChatError('INVALID_RESPONSE');
+      return value;
     } finally {
       dispose();
     }

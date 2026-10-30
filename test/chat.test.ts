@@ -899,22 +899,36 @@ test('draw decisions acknowledge first, then draw with the decision context in a
   }
 });
 
-test('file decisions return the attachment, retain a named marker and reject malformed files', async () => {
-  let input: Record<string, unknown> = { shouldReply: true, reply: '給你', draw: '圖', file: { name: 'a.md', content: '# 標題' } };
-  const { engine, generations } = harness({ generate: () => ({
-    stop_reason: 'tool_use', content: [{ type: 'tool_use', id: 'toolu_file', name: 'conversation_reply', input }],
+test('file decisions acknowledge first, then write the body in a second request', async () => {
+  let input: Record<string, unknown> = { shouldReply: true, reply: '', draw: '圖', file: { name: 'a.pdf', description: '會議紀錄' } };
+  let body: unknown = { content: '第一行' };
+  const { engine, generations } = harness({ generate: request => ({
+    stop_reason: 'tool_use',
+    content: [isRecord(request.tool_choice) && request.tool_choice.name === 'write_file'
+      ? { type: 'tool_use', id: 'toolu_write', name: 'write_file', input: body }
+      : { type: 'tool_use', id: 'toolu_file', name: 'conversation_reply', input }],
   }) });
   const turn = requireTurn(await engine.prepare('chat', 'make'));
-  assert.deepEqual([turn.text, typeof turn.draw, turn.file], ['給你', 'function', { name: 'a.md', content: '# 標題' }]);
+  // The file acknowledgement wins when both a picture and a file were requested.
+  assert.deepEqual([turn.text, typeof turn.draw, turn.file?.name], ['收到，正在準備檔案，請稍等。', 'function', 'a.pdf']);
+  assert.ok(turn.file);
+  assert.equal(generations().length, 1);
+  assert.equal(await turn.file.write(new AbortController().signal), '第一行');
+  const system = generations()[1].body.system.at(-1)?.text ?? '';
+  assert.match(system, /"a\.pdf"/);
+  assert.match(system, /會議紀錄/);
+  assert.match(system, /do not use Markdown/);
+  body = { content: '' };
+  await assert.rejects(turn.file.write(new AbortController().signal), hasCode('INVALID_RESPONSE'));
   turn.commit();
   input = { shouldReply: true, reply: 'next' };
   requireTurn(await engine.prepare('chat', 'again'));
   assert.deepEqual(generations().at(-1)?.body.messages.map(message => message.content),
-    ['make', '給你\n（附上一張圖片）\n（附上檔案 a.md）', 'again']);
-  for (const file of [{ name: 'a.txt', content: ' ' }, { name: 'a.txt' }, { name: 1, content: 'x' }, { name: 'a.txt', content: 'x', extra: 1 }, 'a.txt']) {
+    ['make', '收到，正在準備檔案，請稍等。\n（附上一張圖片）\n（附上檔案 a.pdf）', 'again']);
+  for (const file of [{ name: 'a.txt', description: ' ' }, { name: 'a.txt' }, { name: 1, description: 'x' }, { name: 'a.txt', description: 'x', extra: 1 }, 'a.txt']) {
     input = { shouldReply: true, reply: '', file };
     await assert.rejects(engine.prepare('chat', 'bad'), hasCode('INVALID_RESPONSE'));
   }
-  input = { shouldReply: false, reply: '', file: { name: 'a.txt', content: 'x' } };
+  input = { shouldReply: false, reply: '', file: { name: 'a.txt', description: 'x' } };
   await assert.rejects(engine.prepare('chat', 'bad'), hasCode('INVALID_RESPONSE'));
 });

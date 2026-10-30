@@ -137,6 +137,7 @@ const MEDIA_NOTICES: Record<string, string> = {
   pdf_unavailable: '目前無法產生 PDF，可以改用 txt 或 md。',
   file_invalid: '檔案格式有誤，沒有送出。',
   file_failed: '檔案沒有送出成功，請稍後再試。',
+  file_write_failed: '檔案沒有寫成功，請稍後再試。',
 };
 
 function delay(ms: number, signal: AbortSignal): Promise<void> {
@@ -666,18 +667,24 @@ export class ChatBot {
     return this.upload(renderSvg(svg, this.config.cjkFont), { 'content-type': 'image/png' }, 'image_failed', signal);
   }
 
-  async uploadFile({ name, content }: { name: string; content: string }, signal: AbortSignal): Promise<string> {
+  async uploadFile({ name, write }: { name: string; write: (signal: AbortSignal) => Promise<string> }, signal: AbortSignal): Promise<string> {
     if (!this.capabilities.has('media:upload')) throw failure('file_unavailable');
     const format = /^[^/\\\x00-\x1f\x7f]{1,100}\.(txt|md|csv|pdf)$/i.exec(name)?.[1].toLowerCase();
+    if (!format) throw failure('file_invalid');
+    // Check before paying for the body; only PDFs carry a font.
+    const font = format === 'pdf' ? this.config.cjkFont : undefined;
+    if (format === 'pdf' && !font) throw failure('pdf_unavailable');
+    let content: string;
+    try { content = await write(signal); }
+    catch { throw failure(signal.aborted ? 'cancelled' : 'file_write_failed'); }
     // LINE.js accepts only UTF-8 text without control characters other than whitespace.
-    if (!format || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(content)) throw failure('file_invalid');
+    if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(content)) throw failure('file_invalid');
     const headers = { 'x-file-name': encodeURIComponent(name) };
-    if (format !== 'pdf') {
+    if (!font) {
       return this.upload(Buffer.from(content), { ...headers, 'content-type': 'text/plain; charset=utf-8' }, 'file_failed', signal);
     }
-    if (!this.config.cjkFont) throw failure('pdf_unavailable');
     let pdf: Buffer<ArrayBuffer>;
-    try { pdf = await renderPdf(content, this.config.cjkFont); }
+    try { pdf = await renderPdf(content, font); }
     catch { throw failure('file_invalid'); }
     return this.upload(pdf, { ...headers, 'content-type': 'application/pdf' }, 'file_failed', signal);
   }
