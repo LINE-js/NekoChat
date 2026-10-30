@@ -77,6 +77,7 @@ const MAX_CONTEXT_TOKENS = 100_000;
 const COMPRESS_MIN_BYTES = 4096;
 // Byte-level tokenizers spend at least one UTF-8 byte per token; this covers the prompt template the JSON body omits.
 const TEMPLATE_TOKENS = 2048;
+const BREAKPOINT = { mode: 'explicit' } as const;
 
 function compress(json: string, signal: AbortSignal): Promise<Buffer<ArrayBuffer>> {
   signal.throwIfAborted();
@@ -399,8 +400,14 @@ export class ChatEngine implements ChatEngineLike {
       url: `${OPENAI_API}/responses${generate ? '' : '/input_tokens'}`,
       body: {
         model: config.model,
-        instructions: this.#personality ? `${this.#personality}\n${instruction}` : instruction,
-        input: messages,
+        // Top-level instructions cannot hold a cache breakpoint; a leading developer message mirrors the Claude breakpoints.
+        input: [{
+          role: 'developer',
+          content: [
+            ...(this.#personality ? [{ type: 'input_text', text: this.#personality, prompt_cache_breakpoint: BREAKPOINT }] : []),
+            { type: 'input_text', text: instruction, ...(decision ? { prompt_cache_breakpoint: BREAKPOINT } : {}) },
+          ],
+        }, ...messages],
         // Strict mode requires every property, but the decision's draw and file fields are optional.
         tools: [{ type: 'function', name: tool.name, description: tool.description, parameters: tool.input_schema, strict: false }],
         tool_choice: { type: 'function', name: tool.name }, parallel_tool_calls: false,

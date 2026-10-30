@@ -1003,8 +1003,16 @@ test('OpenAI counts, decides, draws JPEGs and writes files through its own APIs'
   for (const { headers } of calls) {
     assert.deepEqual(headers, { authorization: 'Bearer openai-secret-key', 'content-type': 'application/json' });
   }
-  assert.deepEqual(decide.body.input, [{ role: 'user', content: 'draw' }]);
-  assert.match(String(decide.body.instructions), /^Always be a helpful cat\.\n/);
+  const breakpoints = (input: unknown) => {
+    assert.ok(Array.isArray(input) && isRecord(input[0]) && input[0].role === 'developer' && Array.isArray(input[0].content));
+    return input[0].content.map((block: unknown) => isRecord(block) && block.prompt_cache_breakpoint);
+  };
+  assert.ok(Array.isArray(decide.body.input));
+  assert.deepEqual(decide.body.input.slice(1), [{ role: 'user', content: 'draw' }]);
+  assert.equal(decide.body.input[0].content[0].text, 'Always be a helpful cat.');
+  // Personality and the decision instruction each end a reusable prefix, like the Claude cache breakpoints.
+  assert.deepEqual(breakpoints(decide.body.input), [{ mode: 'explicit' }, { mode: 'explicit' }]);
+  assert.equal(decide.body.instructions, undefined);
   assert.deepEqual([decide.body.model, decide.body.tool_choice, decide.body.parallel_tool_calls, decide.body.reasoning, decide.body.max_output_tokens, decide.body.store],
     ['gpt-6-luna', { type: 'function', name: 'conversation_reply' }, false, { effort: 'none' }, 10, false]);
   assert.ok(Array.isArray(decide.body.tools) && isRecord(decide.body.tools[0]) && decide.body.tools[0].strict === false);
@@ -1023,6 +1031,8 @@ test('OpenAI counts, decides, draws JPEGs and writes files through its own APIs'
   assert.ok(file);
   assert.equal(await file.write(new AbortController().signal), '內容');
   assert.equal(toolName(calls.at(-1)?.body ?? {}), 'write_file');
+  // Follow-up tools differ from the decision tool, so only the personality breakpoint applies.
+  assert.deepEqual(breakpoints(calls.at(-1)?.body.input), [{ mode: 'explicit' }, undefined]);
 
   generated = { status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' }, output: [] };
   await assert.rejects(engine.prepare('chat', 'long'), hasCode('OUTPUT_TRUNCATED'));
