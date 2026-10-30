@@ -505,6 +505,7 @@ test('name and targeted metadata triggers are direct, then followups can respond
   f.send(message('related', { text: 'related', mentions: [] }));
   f.send(message('unrelated', { text: 'unrelated', mentions: [] }));
   f.send(message('related-again', { text: 'related again', mentions: [] }));
+  await until(() => f.calls.length === 4 && f.bot.jobs.size === 0);
   f.send(message('mention', { text: 'hi @Bot', mentions: [{ userId: 'self', start: 3, end: 7 }] }));
   await until(() => f.calls.length === 5 && f.bot.jobs.size === 0);
   assert.deepEqual(f.calls.map(call => call.options), [
@@ -516,6 +517,27 @@ test('name and targeted metadata triggers are direct, then followups can respond
   f.send(message('isolated', { channelId: 'second', text: 'ordinary', mentions: [] }));
   await until(() => f.bot.seen.size === 6 && f.bot.jobs.size === 0);
   assert.equal(f.calls.length, 5);
+});
+
+test('a direct call skips queued chatter but keeps possible replies and other chats', async t => {
+  const gate = Promise.withResolvers<void>();
+  const f = await fixture(t, { prepare: async ({ input }) => {
+    if (inputJson(input).text === '＠語喵') await gate.promise;
+    return { text: 'answer', commit: () => {} };
+  } });
+  f.send(message('first', { text: '＠語喵', mentions: [] }));
+  await until(() => f.calls.length === 1);
+  f.bot.engaged.add('group');
+  f.send(message('chatter', { text: 'chatter', mentions: [] }));
+  // A reply to a message whose author is unknown may still be addressed to the bot.
+  f.send(message('maybe', { text: 'maybe', mentions: [], replyTo: 'unknown-author' }));
+  f.send(message('elsewhere', { channelId: 'second', text: 'ordinary', mentions: [] }));
+  f.send(message('call', { text: '語喵在嗎', mentions: [] }));
+  await until(() => f.logs.includes('queue_superseded'));
+  assert.equal(f.logs.filter(code => code === 'queue_superseded').length, 1);
+  gate.resolve();
+  await until(() => f.bot.jobs.size === 0 && f.calls.length === 3);
+  assert.deepEqual(f.calls.map(call => inputJson(call.input).text), ['＠語喵', 'maybe', '語喵在嗎']);
 });
 
 test('a declined name trigger does not send or engage the chat', async t => {

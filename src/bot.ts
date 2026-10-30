@@ -69,6 +69,8 @@ interface WaitingMessage {
   queue: MessageQueue;
   /** Current admin token found in the text; ownership is proven only by consuming it. */
   token?: string;
+  /** Certainly not addressed to the bot: only a followup judgement could answer it. */
+  ambient: boolean;
 }
 
 interface MessageQueue {
@@ -566,20 +568,31 @@ export class ChatBot {
     }
     const adminToken = this.adminTokens.get(message.channelId);
     const token = adminToken && message.text.includes(adminToken) ? adminToken : undefined;
+    const direct = token !== undefined ||
+      (typeof ownId === 'string' ? this.isDirect(message, ownId) : message.text.includes('語喵'));
+    const maybeReply = typeof message.replyTo === 'string' && message.replyTo !== '' &&
+      this.knownAuthor(message.channelId, message.replyTo) !== false;
     // Pending work may engage the chat before this message is processed.
-    if (!token && !this.engaged.has(message.channelId) && !this.jobs.has(message.channelId) &&
-        !(typeof message.replyTo === 'string' && message.replyTo &&
-          this.knownAuthor(message.channelId, message.replyTo) !== false) &&
-        !(typeof ownId === 'string'
-          ? this.isDirect(message, ownId)
-          : message.text.includes('語喵') || (Array.isArray(message.mentions) && message.mentions.length > 0))) return;
-    this.enqueue(message, token);
+    if (!direct && !maybeReply && !this.engaged.has(message.channelId) && !this.jobs.has(message.channelId) &&
+        !(typeof ownId !== 'string' && Array.isArray(message.mentions) && message.mentions.length > 0)) return;
+    this.enqueue(message, token, direct, !direct && !maybeReply && typeof ownId === 'string');
   }
 
-  enqueue(message: LineMessage, token?: string): void {
+  enqueue(message: LineMessage, token: string | undefined, direct: boolean, ambient: boolean): void {
     if (this.stopped || !this.ready) return;
     const chatId = message.channelId;
     let queue = this.jobs.get(chatId);
+    // Someone calling the bot should not wait behind chatter that most likely needs no answer.
+    if (direct && queue) {
+      for (let index = queue.waiting.length - 1; index >= 0; index--) {
+        const entry = queue.waiting[index];
+        if (!entry.ambient) continue;
+        queue.waiting.splice(index, 1);
+        this.waiting.delete(entry);
+        this.outstanding--;
+        this.log('queue_superseded');
+      }
+    }
     let victim: WaitingMessage | undefined;
     const chatCount = queue ? queue.waiting.length + (queue.active ? 1 : 0) : 0;
     if (chatCount >= this.config.line.maxPendingPerChat) {
@@ -607,7 +620,7 @@ export class ChatBot {
       queue = { chatId, waiting: [] };
       this.jobs.set(chatId, queue);
     }
-    const entry: WaitingMessage = { message, queue, ...(token ? { token } : {}) };
+    const entry: WaitingMessage = { message, queue, ambient, ...(token ? { token } : {}) };
     queue.waiting.push(entry);
     this.waiting.add(entry);
     this.outstanding++;
