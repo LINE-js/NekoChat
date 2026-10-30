@@ -188,6 +188,8 @@ export class ChatBot {
   pending: Map<string, PendingRequest>;
   identities: Map<string, string | Promise<string>>;
   jobs: Map<string, MessageQueue>;
+  /** Media still uploading after its turn released the chat queue; sent in turn order per chat. */
+  deliveries: Map<string, { tail: Promise<void>; controllers: Set<AbortController> }>;
   waiting: Set<WaitingMessage>;
   outstanding: number;
   seen: Map<string, boolean>;
@@ -222,6 +224,7 @@ export class ChatBot {
     this.pending = new Map();
     this.identities = new Map();
     this.jobs = new Map();
+    this.deliveries = new Map();
     this.waiting = new Set();
     this.outstanding = 0;
     this.seen = new Map();
@@ -326,7 +329,7 @@ export class ChatBot {
     this.ready = false;
     this.userId = undefined;
     this.channels = undefined;
-    for (const chatId of this.jobs.keys()) this.cancelChat(chatId);
+    for (const chatId of [...this.jobs.keys(), ...this.deliveries.keys()]) this.cancelChat(chatId);
     this.identities.clear();
     this.engaged.clear();
     this.referenceAuthors.clear();
@@ -343,6 +346,11 @@ export class ChatBot {
       this.outstanding -= queue.waiting.length + (queue.active ? 1 : 0);
       queue.waiting.length = 0;
       if (queue.active) queue.active.abort();
+    }
+    const delivery = this.deliveries.get(chatId);
+    if (delivery) {
+      this.deliveries.delete(chatId);
+      for (const controller of delivery.controllers) controller.abort();
     }
     for (const request of [...this.pending.values()]) {
       if (request.chatId === chatId) request.reject(failure('cancelled'));
@@ -616,7 +624,7 @@ export class ChatBot {
     this.waiting.delete(entry);
     const controller = new AbortController();
     queue.active = controller;
-    void this.reply(entry.message, controller.signal, entry.token).catch((error: unknown) => {
+    void this.reply(entry.message, controller, entry.token).catch((error: unknown) => {
       if (!controller.signal.aborted) this.log(codeOf(error) === 'identity_unavailable' ? 'identity_unavailable' : 'reply_failed');
     }).finally(() => {
       queue.active = undefined;
@@ -712,7 +720,8 @@ export class ChatBot {
     return result.mediaId;
   }
 
-  async reply(message: LineMessage, signal: AbortSignal, token?: string): Promise<void> {
+  async reply(message: LineMessage, controller: AbortController, token?: string): Promise<void> {
+    const { signal } = controller;
     if (signal.aborted || !this.ready) return;
     const ownId = await this.ownId(message, signal);
     if (!ownId || signal.aborted) return;
@@ -747,28 +756,47 @@ export class ChatBot {
       if (signal.aborted || !this.ready) return;
       await this.request('message:send', { chatId: message.channelId, text, replyTo: message.messageId }, 'sent', signal);
     }
-    // A missing picture or file is reported in the chat so the request does not look ignored.
-    let complete = true;
-    for (const upload of media) {
-      let payload: { chatId: string; mediaId: string } | { chatId: string; text: string; replyTo: string };
-      try {
-        payload = { chatId: message.channelId, mediaId: await upload };
-      } catch (error) {
-        if (signal.aborted) return;
-        const code = codeOf(error) ?? '';
-        if (!Object.hasOwn(MEDIA_NOTICES, code)) throw error;
-        this.log(code);
-        complete = false;
-        payload = { chatId: message.channelId, text: MEDIA_NOTICES[code], replyTo: message.messageId };
+    if (signal.aborted || !this.ready) return;
+    // Media can take minutes; the turn is retained once acknowledged so the chat queue can move on.
+    result.commit();
+    this.engaged.add(message.channelId);
+    if (media.length > 0) this.deliver(message, media, controller);
+  }
+
+  /** Sends a turn's media after earlier turns' media in the same chat; cancelChat aborts it. */
+  deliver(message: LineMessage, media: Promise<string>[], controller: AbortController): void {
+    const chatId = message.channelId;
+    const { signal } = controller;
+    let delivery = this.deliveries.get(chatId);
+    if (!delivery) {
+      delivery = { tail: Promise.resolve(), controllers: new Set() };
+      this.deliveries.set(chatId, delivery);
+    }
+    const current = delivery;
+    current.controllers.add(controller);
+    current.tail = current.tail.then(async () => {
+      // A missing picture or file is reported in the chat so the request does not look ignored.
+      for (const upload of media) {
+        let payload: { chatId: string; mediaId: string } | { chatId: string; text: string; replyTo: string };
+        try {
+          payload = { chatId, mediaId: await upload };
+        } catch (error) {
+          if (signal.aborted) return;
+          const code = codeOf(error) ?? '';
+          if (!Object.hasOwn(MEDIA_NOTICES, code)) throw error;
+          this.log(code);
+          payload = { chatId, text: MEDIA_NOTICES[code], replyTo: message.messageId };
+        }
+        await this.rateLimit(signal);
+        if (signal.aborted || !this.ready) return;
+        await this.request('message:send', payload, 'sent', signal);
       }
-      await this.rateLimit(signal);
-      if (signal.aborted || !this.ready) return;
-      await this.request('message:send', payload, 'sent', signal);
-    }
-    if (complete && !signal.aborted && this.ready) {
-      result.commit();
-      this.engaged.add(message.channelId);
-    }
+    }).catch(() => {
+      if (!signal.aborted) this.log('reply_failed');
+    }).finally(() => {
+      current.controllers.delete(controller);
+      if (current.controllers.size === 0 && this.deliveries.get(chatId) === current) this.deliveries.delete(chatId);
+    });
   }
 
   rateLimit(signal: AbortSignal): Promise<void> {

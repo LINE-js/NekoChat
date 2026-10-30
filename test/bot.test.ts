@@ -1416,23 +1416,36 @@ test('the acknowledgement is sent before drawing finishes, then the PNG is uploa
   f.send(message('caption'));
   await until(() => f.sends.length === 1);
   await sleep(20);
-  assert.deepEqual([f.sends[0].text, f.uploads.length, f.media.length, commits.length], ['畫圖中', 0, 0, 0]);
-  finish.resolve();
-  await until(() => commits.length === 1);
-  assert.deepEqual(f.requests.filter(request => request.type === 'message:send').map(request => 'text' in request ? request.text : request.mediaId),
-    ['畫圖中', 'upload-1']);
-  const [upload] = f.uploads;
-  assert.equal(upload.headers.authorization, 'Bearer local-test-token');
-  assert.equal(upload.headers['content-type'], 'image/png');
-  assert.equal(upload.headers.origin, undefined);
-  assert.deepEqual([...upload.body.subarray(1, 4)], [...Buffer.from('PNG')]);
-  // The longer side is scaled to 1024 px (IHDR width, height).
-  assert.deepEqual([upload.body.readUInt32BE(16), upload.body.readUInt32BE(20)], [1024, 512]);
-  // An image-only turn sends no empty text.
+  assert.deepEqual([f.sends[0].text, f.uploads.length, f.media.length, commits.length], ['畫圖中', 0, 0, 1]);
+  // The chat queue moves on while the picture is still being drawn; an image-only turn sends no empty text.
   f.send(message('silent'));
-  await until(() => f.media.length === 2);
-  assert.equal(f.sends.length, 1);
   await until(() => commits.length === 2);
+  assert.deepEqual([f.sends.length, f.media.length], [1, 0]);
+  finish.resolve();
+  await until(() => f.media.length === 2);
+  assert.equal(f.requests.find(request => request.type === 'message:send'), f.sends[0]);
+  for (const upload of f.uploads) {
+    assert.equal(upload.headers.authorization, 'Bearer local-test-token');
+    assert.equal(upload.headers['content-type'], 'image/png');
+    assert.equal(upload.headers.origin, undefined);
+    assert.deepEqual([...upload.body.subarray(1, 4)], [...Buffer.from('PNG')]);
+    // The longer side is scaled to 1024 px (IHDR width, height).
+    assert.deepEqual([upload.body.readUInt32BE(16), upload.body.readUInt32BE(20)], [1024, 512]);
+  }
+});
+
+test('cancelling a chat stops media that is still being prepared after its turn', async t => {
+  const finish = Promise.withResolvers<void>();
+  const { f, commits } = await imageFixture(t, () => ({ svg: SVG }), finish.promise);
+  f.send({ type: 'hello', protocol: 2, capabilities: ['chat:admins', 'media:upload'] });
+  f.send(message('caption'));
+  await until(() => commits.length === 1 && f.bot.deliveries.size === 1);
+  f.send({ type: 'message:unsend', chatId: 'group', messageId: 'caption' });
+  await until(() => f.bot.deliveries.size === 0);
+  finish.resolve();
+  await sleep(50);
+  assert.deepEqual([f.uploads.length, f.media.length, f.sends.length], [0, 0, 1]);
+  assert.ok(!f.logs.includes('reply_failed'));
 });
 
 test('finished JPEGs from OpenAI upload unchanged, and rejected prompts get their own notice', async t => {
@@ -1443,16 +1456,16 @@ test('finished JPEGs from OpenAI upload unchanged, and rejected prompts get thei
   });
   f.send({ type: 'hello', protocol: 2, capabilities: ['chat:admins', 'media:upload'] });
   f.send(message('photo'));
-  await until(() => commits.length === 1);
+  await until(() => f.media.length === 1);
   assert.equal(f.uploads[0].headers['content-type'], 'image/jpeg');
   assert.deepEqual(f.uploads[0].body, jpeg);
   f.send(message('rejected'));
   await until(() => f.logs.includes('image_rejected'));
   await until(() => f.sends.length === 1);
-  assert.deepEqual([f.sends[0].text, f.uploads.length, commits.length], ['這張圖沒辦法畫，請換個主題或說法。', 1, 1]);
+  assert.deepEqual([f.sends[0].text, f.uploads.length, commits.length], ['這張圖沒辦法畫，請換個主題或說法。', 1, 2]);
 });
 
-test('failed drawing, unsafe SVGs, missing upload support and failed uploads are reported and skip the commit', async t => {
+test('failed drawing, unsafe SVGs, missing upload support and failed uploads are reported in the chat', async t => {
   const { f, commits } = await imageFixture(t, text => {
     if (text === '@broken') throw new Error('generation failed');
     return { svg: text === '@unsafe' ? '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 4 4"><image href="/etc/secret.png" width="4" height="4"/></svg>' : SVG };
@@ -1470,7 +1483,6 @@ test('failed drawing, unsafe SVGs, missing upload support and failed uploads are
   await until(() => f.logs.filter(code => code === 'image_failed').length === 2);
   assert.equal(f.uploads.length, 1);
   assert.equal(f.media.length, 0);
-  assert.deepEqual(commits, []);
   await until(() => f.sends.length === 4);
   assert.deepEqual(f.sends.map(request => [request.text, request.replyTo]), [
     ['目前無法傳送圖片。', 'unsupported'],
@@ -1478,6 +1490,8 @@ test('failed drawing, unsafe SVGs, missing upload support and failed uploads are
     ['圖片沒有送出成功，請稍後再試。', 'broken'],
     ['圖片沒有送出成功，請稍後再試。', 'failed'],
   ]);
+  // The acknowledged turns stay in context even though their pictures failed.
+  assert.equal(commits.length, 4);
 });
 
 async function fileFixture(t: TestContext, file: (text: string) => { name: string; content: string }, cjkFont?: CjkFont, written?: Promise<void>) {
@@ -1505,11 +1519,11 @@ test('the acknowledgement precedes writing, then text attachments upload as UTF-
   f.send(message('csv'));
   await until(() => f.sends.length === 1);
   await sleep(20);
-  assert.deepEqual([f.sends[0].text, f.uploads.length, commits.length], ['準備中', 0, 0]);
+  assert.deepEqual([f.sends[0].text, f.uploads.length, commits.length], ['準備中', 0, 1]);
   finish.resolve();
-  await until(() => commits.length === 1);
+  await until(() => f.media.length === 1);
   f.send(message('md'));
-  await until(() => commits.length === 2);
+  await until(() => f.media.length === 2);
   assert.deepEqual(f.requests.filter(request => request.type === 'message:send').map(request => 'text' in request ? request.text : request.mediaId),
     ['準備中', 'upload-1', '準備中', 'upload-2']);
   assert.deepEqual(f.uploads.map(upload => [upload.headers['x-file-name'], upload.headers['content-type'], upload.body.toString()]), [
@@ -1530,7 +1544,7 @@ test('invalid, failed and font-less attachments are reported instead of uploaded
     await until(() => f.sends.length === 2 * (['ext', 'path', 'control', 'fail', 'pdf'].indexOf(id) + 1));
   }
   assert.equal(f.uploads.length, 0);
-  assert.deepEqual(commits, []);
+  assert.equal(commits.length, 5);
   // Bad names and a missing PDF font are refused before paying for the body.
   assert.deepEqual(writes, ['a.txt', 'b.txt']);
   assert.deepEqual(f.logs.filter(code => code.startsWith('file') || code.startsWith('pdf')),
@@ -1543,9 +1557,9 @@ test('invalid, failed and font-less attachments are reported instead of uploaded
 
 
 test('PDF attachments are typeset with the configured font', { skip: !SYSTEM_CJK_FONT && 'no system CJK font' }, async t => {
-  const { f, commits } = await fileFixture(t, () => ({ name: '說明.pdf', content: '語喵的文件\n第二行' }), SYSTEM_CJK_FONT);
+  const { f } = await fileFixture(t, () => ({ name: '說明.pdf', content: '語喵的文件\n第二行' }), SYSTEM_CJK_FONT);
   f.send(message('pdf'));
-  await until(() => commits.length === 1);
+  await until(() => f.media.length === 1);
   const [upload] = f.uploads;
   assert.equal(upload.headers['content-type'], 'application/pdf');
   assert.equal(upload.headers['x-file-name'], encodeURIComponent('說明.pdf'));
