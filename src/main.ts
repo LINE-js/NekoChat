@@ -21,11 +21,15 @@ if (!valid) {
   try {
     const { config, system } = await loadConfig(filename);
     if (check) {
-      console.log(`本機設定與個性資料檢查通過；上下文上限 ${config.claude.contextTokens} tokens（含輸出預留）。尚未驗證外部服務。`);
+      const label = (provider: 'openai' | 'claude') => provider === 'openai'
+        ? `OpenAI（${config.openai?.model}，圖片 ${config.openai?.imageModel}）` : `Claude（${config.claude?.model}）`;
+      const backup = config.provider === 'openai' ? (config.claude ? 'claude' : undefined) : (config.openai ? 'openai' : undefined);
+      console.log(`本機設定與個性資料檢查通過；主要使用 ${label(config.provider)}${backup ? `，備用 ${label(backup)}` : '，未設定備用'}。尚未驗證外部服務。`);
       console.log(config.cjkFont ? `CJK 字型：${config.cjkFont.file}` : '找不到 CJK 字型：PDF 附件停用，圖片中的文字可能無法顯示；請安裝 Noto Sans CJK 或設定 cjkFont。');
     } else {
-      const engine = new ChatEngine({ claude: config.claude, system });
-      bot = new ChatBot({ config, engine, log: code => console.log(`[NekoChat] ${code}`) });
+      const log = (code: string) => console.log(`[NekoChat] ${code}`);
+      const engine = new ChatEngine({ provider: config.provider, openai: config.openai, claude: config.claude, system, log });
+      bot = new ChatBot({ config, engine, log });
       const activeBot = bot;
       shutdown = () => activeBot.stop();
       process.once('SIGINT', shutdown);

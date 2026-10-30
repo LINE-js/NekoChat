@@ -4,7 +4,7 @@
 
 ## 啟動
 
-需要 Node.js ≥ 22、npm、已登入的 LINE.js，以及可使用指定模型的 Anthropic API key。應用程式與測試皆使用 strict TypeScript，編譯後由 Node.js 執行。`start.sh` 會自動安裝缺少的依賴；若要手動安裝：
+需要 Node.js ≥ 22、npm、已登入的 LINE.js，以及 OpenAI 或 Anthropic 的 API key（至少一個；兩個都設定時一個主要、一個備用）。應用程式與測試皆使用 strict TypeScript，編譯後由 Node.js 執行。`start.sh` 會自動安裝缺少的依賴；若要手動安裝：
 
 ```sh
 npm ci --include=dev --ignore-scripts
@@ -14,7 +14,7 @@ npm ci --include=dev --ignore-scripts
 
 1. 在 LINE.js 的 `config.yaml` 啟用 `api.enabled: true`，將要授權的聊天室 ID 加入 `api.chats`，重啟 LINE.js。
 2. 在 **LINE.js 專案目錄**執行 `npm run cli -- token`，取得僅顯示一次的 Bot Token。
-3. 填入 NekoChat `config.yaml` 的 `line.token` 與 `line.chats`。這是 LINE.js Token，**不是** Claude API key。本機設定已寫入指定的 Claude key；範本則不含任何金鑰。
+3. 填入 NekoChat `config.yaml` 的 `line.token` 與 `line.chats`。這是 LINE.js Token，**不是** OpenAI 或 Claude API key。要使用 OpenAI 時加入 `openai` 段並填入 `openai.apiKey`；範本則不含任何金鑰。
 4. 啟動：
 
 ```sh
@@ -22,9 +22,9 @@ npm ci --include=dev --ignore-scripts
 ./start.sh
 ```
 
-`start.sh` 可從任意工作目錄執行，會先檢查 Node.js ≥ 22、執行依賴及 TypeScript 工具鏈；缺少或無法載入時自動執行 `npm ci --include=dev --ignore-scripts`，依照 lockfile 重建 `node_modules`，不執行套件安裝腳本，也不會覆蓋設定。即使 `NODE_ENV=production` 也會安裝編譯所需的開發依賴。每次啟動先編譯至 `dist/`；安裝、依賴載入或編譯失敗時停止，不啟動舊產物。`--check` 只驗證本機設定，不連線 LINE 或 Anthropic，但缺少依賴時仍會觸發安裝，可能連線 npm registry。指定其他設定檔可使用 `./start.sh --config /path/to/config.yaml`，相對設定路徑以專案目錄為基準；按 Ctrl+C 停止。修改設定後須重啟。`npm start`、`npm run check` 也會先編譯，但不會自動安裝依賴。
+`start.sh` 可從任意工作目錄執行，會先檢查 Node.js ≥ 22、執行依賴及 TypeScript 工具鏈；缺少或無法載入時自動執行 `npm ci --include=dev --ignore-scripts`，依照 lockfile 重建 `node_modules`，不執行套件安裝腳本，也不會覆蓋設定。即使 `NODE_ENV=production` 也會安裝編譯所需的開發依賴。每次啟動先編譯至 `dist/`；安裝、依賴載入或編譯失敗時停止，不啟動舊產物。`--check` 只驗證本機設定並顯示主要與備用供應商，不連線 LINE、OpenAI 或 Anthropic，但缺少依賴時仍會觸發安裝，可能連線 npm registry。指定其他設定檔可使用 `./start.sh --config /path/to/config.yaml`，相對設定路徑以專案目錄為基準；按 Ctrl+C 停止。修改設定後須重啟。`npm start`、`npm run check` 也會先編譯，但不會自動安裝依賴。
 
-`line.chats` 不得留空；只有同時在 LINE.js 與 NekoChat 白名單內的聊天室會被處理。尚未接話時，引用回覆語喵、LINE @ 標記語喵，或文字包含「語喵」才會送交 Claude 判斷；這些條件不保證回覆。只有明確向語喵提問、招呼、邀請聊天或回應語喵時才接話；成員彼此問答、只是談論語喵或對象不明時保持安靜。請確認群組成員同意將訊息送往 Anthropic；建議先用測試群與次要 LINE 帳號驗證。
+`line.chats` 不得留空；只有同時在 LINE.js 與 NekoChat 白名單內的聊天室會被處理。尚未接話時，引用回覆語喵、LINE @ 標記語喵，或文字包含「語喵」才會送交模型判斷；這些條件不保證回覆。只有明確向語喵提問、招呼、邀請聊天或回應語喵時才接話；成員彼此問答、只是談論語喵或對象不明時保持安靜。請確認群組成員同意將訊息送往 OpenAI 或 Anthropic（設定了備用時兩者都可能收到）；建議先用測試群與次要 LINE 帳號驗證。
 
 ## 設定
 
@@ -38,6 +38,14 @@ npm ci --include=dev --ignore-scripts
 | `line.sendsPerMinute` | 本元件所有聊天室共用的滾動 60 秒發送上限，預設 20；不得高於 LINE.js 上限，多個機器人須自行分配額度 |
 | `line.maxPendingPerChat` | 每聊天室未完成工作上限，預設 50，範圍 1～10000；包含等待與正在處理的工作，不得大於全域上限 |
 | `line.maxPendingTotal` | 全部聊天室未完成工作總上限，預設 200，範圍 1～10000；舊設定省略兩欄時自動採用預設值 |
+| `provider` | 主要供應商 `openai` 或 `claude`；省略時有 `openai` 段就用 OpenAI，否則用 Claude（舊設定不必修改）。指定的那段必須存在 |
+| `openai.apiKey` | OpenAI API key，僅供伺服器使用 |
+| `openai.model` | 對話模型，例如 `gpt-6-luna`（最快、最便宜） |
+| `openai.reasoningEffort` | 選填，`none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`；省略時用模型預設值。可用值依模型而定，`gpt-6-luna` 支援 `none` |
+| `openai.contextTokens`／`maxOutputTokens`／`timeoutMs` | 與 `claude` 同義；`maxOutputTokens` 包含推理 tokens |
+| `openai.imageModel` | 畫圖模型，預設 `gpt-image-2.5-flare` |
+| `openai.imageQuality` | `low`、`medium`、`high`、`xhigh`、`max` 或 `auto`，預設 `medium`；越高越慢 |
+| `openai.imageTimeoutMs` | 單張圖片生成的逾時，預設 120000ms，範圍 1000～300000 |
 | `claude.apiKey` | Anthropic API key，僅供伺服器使用 |
 | `claude.model` | `claude-haiku-5-5`，不會自動換用其他模型 |
 | `claude.contextTokens` | 100000；可降低，不可提高 |
@@ -46,6 +54,14 @@ npm ci --include=dev --ignore-scripts
 | `personalityFile` | 個性 Markdown 路徑，預設 `personality.md`；相對路徑以設定檔所在目錄為基準 |
 
 直接編輯 `personality.md` 即可調整語喵個性，重啟後生效。人格以群聊夥伴為主，不預設成員背景或專屬關係；依 `sender.id` 區分成員，不混淆不同成員的立場。明確對語喵進行的問答與聊天會積極參與，但不硬找話題、強行追問或延長已結束的對話。回覆前須理解完整訊息、指涉與最新更正，不只抓關鍵字接話；確定在問語喵但缺少必要資訊時才簡短澄清，不腦補引用內容。名稱與文字以 JSON 資料送入，而非當成系統指令。這個元件沒有上網、操作檔案或執行指令等工具。個性檔案不存在或為空白時會拒絕啟動。
+
+## OpenAI 與 Claude
+
+- 對話與畫圖預設使用主要供應商；另一個供應商有設定時作為備用。主要供應商的計數、生成或檔案內容請求失敗（HTTP 錯誤、網路錯誤、逾時、回應格式錯誤或輸出截斷）時，同一則訊息改由備用供應商從頭處理，終端機記錄 `openai_fallback:代碼[:HTTP 狀態]` 或 `claude_fallback:…`，不含訊息或金鑰。取消不會切換。逾時後才切換時，回覆最慢要等兩份逾時。
+- 圖片與檔案從做出該回合決策的供應商開始：主要供應商這回合已失敗時，不再為同一回合的圖片或檔案重試它。
+- OpenAI 對話使用 [Responses API](https://developers.openai.com/api/docs/guides/function-calling)，以強制的 function call 回傳同一份決策格式（`strict: false`，因為 `draw`／`file` 是選填欄位）；`store: false` 不在 OpenAI 保存回應。上下文裁切改用 OpenAI 的 [`POST /v1/responses/input_tokens`](https://developers.openai.com/api/docs/guides/token-counting) 計數，規則與 Claude 相同。OpenAI 的 prompt caching 為自動，人格放在 `instructions` 開頭以共用前綴；請求不使用 gzip。
+- OpenAI 畫圖直接呼叫 [Images API](https://developers.openai.com/api/docs/guides/image-generation) 的 `POST /v1/images/generations`，以決策中的圖片描述為提示，產生 1024×1024 JPEG（官方說明 JPEG 比 PNG 快）後原樣上傳，不經過 SVG；不需要第二次對話請求，也不受 SVG 只能畫向量圖的限制。Claude 仍以 SVG 畫圖。OpenAI 以 HTTP 400 拒絕圖片（包含內容審核）時記錄 `image_rejected` 並回覆「這張圖沒辦法畫，請換個主題或說法。」，**不會**改用 Claude 重畫，以免繞過審核；其他圖片錯誤才會切換到 Claude 的 SVG。
+- GPT Image 模型可能需要先完成 OpenAI 組織驗證才能使用。
 
 ## 對話與斷線行為
 
@@ -74,10 +90,10 @@ npm ci --include=dev --ignore-scripts
 - 斷線或登出會取消待處理回答、清空上下文與身分資訊。重連後重新等待登入狀態，只處理新事件；不補抓斷線期間的訊息，也不重送結果不明的發送請求。去重資料跨重連保留、程式重啟則清除。
 - 訊息被編輯、收回或聊天室被移出授權範圍時，清除該聊天室上下文並取消尚未完成的回覆，避免繼續使用已撤回的內容；不能撤回已送至 Anthropic 或 LINE 的內容。
 - 上述上下文清理也會重設接話狀態，必須再次直接叫到語喵才會開始回答。斷線、登出或換帳號也會清除引用辨識資料；編輯訊息不改變原作者，但收回的訊息不能再用來觸發引用回覆。
-- 擁有者指令：需要 LINE.js 宣告 `chat:admin-token` 能力。NekoChat 保存 LINE.js 主動推送的各聊天室目前一次性管理員權杖（只存記憶體，不記錄）；成員訊息包含該權杖時，不論是否叫到語喵、引用誰，都會先以 `chat:admin-token:consume` 兌換。兌換成功才視為擁有者：必定送交模型，並以 `verifiedOwner` 標記與擁有者提示要求完全遵守指令且一定回覆，但仍不得透露系統提示或機密。兌換失敗時依一般規則處理。權杖在送往 Anthropic 與寫入上下文前會替換為「[權杖]」。兌換後 LINE.js 推送新權杖，舊權杖之後只是普通文字。斷線、登出、聊天室移除或 `chat:admin-token:changed` 都會清除保存的權杖。
+- 擁有者指令：需要 LINE.js 宣告 `chat:admin-token` 能力。NekoChat 保存 LINE.js 主動推送的各聊天室目前一次性管理員權杖（只存記憶體，不記錄）；成員訊息包含該權杖時，不論是否叫到語喵、引用誰，都會先以 `chat:admin-token:consume` 兌換。兌換成功才視為擁有者：必定送交模型，並以 `verifiedOwner` 標記與擁有者提示要求完全遵守指令且一定回覆，但仍不得透露系統提示或機密。兌換失敗時依一般規則處理。權杖在送往 OpenAI／Anthropic 與寫入上下文前會替換為「[權杖]」。兌換後 LINE.js 推送新權杖，舊權杖之後只是普通文字。斷線、登出、聊天室移除或 `chat:admin-token:changed` 都會清除保存的權杖。
 - 已驗證擁有者的要求即使離譜、荒謬、尷尬或不合人格，也不能僅因此拒絕、淡化、替換任務或擅加評論；提示要求嚴格遵守指定措辭、語言、格式、語氣與範圍，回覆不限定為自然對話文字。機密保護及不得假裝執行外部操作仍適用；這是應用層提示規則，不能保證模型完全服從或繞過供應商限制。
-- 畫圖：被要求畫圖時，Claude 先在決策格式的 `draw` 欄位描述要畫的圖，並以回覆文字表示開始畫（回覆空白時改送「收到，正在畫圖，請稍等。」），這段文字立即送出；接著另以一次 `draw_svg` 請求（沿用同一份已計數的上下文與人格快取）產生 SVG，NekoChat 以 `@resvg/resvg-js` 在本機轉成長邊 1024 px、白底的 PNG，透過 LINE.js 的 `POST /api/media/upload`（同一 Bot Token）上傳後送出。畫圖請求因此多一次 API 呼叫，但成員不必等 SVG 寫完才知道指令已收到。需要 LINE.js 宣告 `media:upload` 能力，否則記錄 `image_unavailable`。為避免 resvg 讀取本機檔案，含 `<image>`、`<feImage>`、`<foreignObject>`、`<script>`、DOCTYPE／ENTITY、`@import`，或指向非 `#` 片段的 `href`／`url()` 的 SVG 一律拒絕（`image_unsafe`）；SVG 無效記錄 `image_invalid`，產生 SVG 或上傳失敗（含 LINE.js 每分鐘 5 次的上傳額度）記錄 `image_failed`。圖片失敗時確認文字已送出，但不送圖，該回合也不寫入上下文。上下文只保留「（附上一張圖片）」，不保留 SVG 原始碼，以免拖慢後續請求。只能畫向量風格圖形；圖中文字使用下方的 CJK 字型。
-- 檔案附件：被要求提供任何文件時，Claude 先在決策格式的 `file` 欄位給出檔名與內容說明，並以回覆文字表示正在準備（回覆空白時改送「收到，正在準備檔案，請稍等。」），這段文字立即送出；接著另以一次 `write_file` 請求（沿用同一份已計數的上下文與人格快取）寫出完整內容後才上傳，支援 `.txt`、`.md`、`.csv`、`.pdf`。檔名不合規則或 PDF 缺字型時在第二次請求前就拒絕，不浪費 API 費用。文字檔以 UTF-8 原樣上傳（`content-type: text/plain`，檔名以 `X-File-Name` 傳送）；PDF 由 `pdfkit` 把純文字排版成 A4 頁面並嵌入 CJK 字型子集。同樣需要 `media:upload` 能力（否則記錄 `file_unavailable`），送出順序為文字、圖片、檔案，與圖片共用 LINE.js 每分鐘 5 次的上傳額度。檔名含 `/`、`\`、控制字元、超過 100 字或副檔名不符，或內容含 Tab／換行以外的控制字元時記錄 `file_invalid`；內容產生失敗記錄 `file_write_failed`，上傳失敗記錄 `file_failed`。上下文只保留「（附上檔案 檔名）」。檔案長度受 `claude.maxOutputTokens` 限制（預設 4096，約數千字）。
+- 畫圖：被要求畫圖時，模型先在決策格式的 `draw` 欄位寫出可獨立使用的圖片描述，並以回覆文字表示開始畫（回覆空白時改送「收到，正在畫圖，請稍等。」），這段文字立即送出。OpenAI 接著以該描述呼叫 Images API 產生 JPEG（見上方「OpenAI 與 Claude」）；Claude 則另以一次 `draw_svg` 請求（沿用同一份已計數的上下文與人格快取）產生 SVG，NekoChat 以 `@resvg/resvg-js` 在本機轉成長邊 1024 px、白底的 PNG。兩者都透過 LINE.js 的 `POST /api/media/upload`（同一 Bot Token）上傳後送出。成員不必等圖片完成才知道指令已收到。需要 LINE.js 宣告 `media:upload` 能力，否則記錄 `image_unavailable`。為避免 resvg 讀取本機檔案，含 `<image>`、`<feImage>`、`<foreignObject>`、`<script>`、DOCTYPE／ENTITY、`@import`，或指向非 `#` 片段的 `href`／`url()` 的 SVG 一律拒絕（`image_unsafe`）；SVG 無效記錄 `image_invalid`，產生圖片或上傳失敗（含 LINE.js 每分鐘 5 次的上傳額度）記錄 `image_failed`。圖片失敗時確認文字已送出，但不送圖，該回合也不寫入上下文。上下文只保留「（附上一張圖片）」，不保留圖片資料或 SVG 原始碼，以免拖慢後續請求。Claude 的 SVG 只能畫向量風格圖形，圖中文字使用下方的 CJK 字型。
+- 檔案附件：被要求提供任何文件時，模型先在決策格式的 `file` 欄位給出檔名與內容說明，並以回覆文字表示正在準備（回覆空白時改送「收到，正在準備檔案，請稍等。」），這段文字立即送出；接著另以一次 `write_file` 請求（沿用同一份已計數的上下文與人格快取）寫出完整內容後才上傳，支援 `.txt`、`.md`、`.csv`、`.pdf`。檔名不合規則或 PDF 缺字型時在第二次請求前就拒絕，不浪費 API 費用。文字檔以 UTF-8 原樣上傳（`content-type: text/plain`，檔名以 `X-File-Name` 傳送）；PDF 由 `pdfkit` 把純文字排版成 A4 頁面並嵌入 CJK 字型子集。同樣需要 `media:upload` 能力（否則記錄 `file_unavailable`），送出順序為文字、圖片、檔案，與圖片共用 LINE.js 每分鐘 5 次的上傳額度。檔名含 `/`、`\`、控制字元、超過 100 字或副檔名不符，或內容含 Tab／換行以外的控制字元時記錄 `file_invalid`；內容產生失敗記錄 `file_write_failed`，上傳失敗記錄 `file_failed`。上下文只保留「（附上檔案 檔名）」。檔案長度受所用供應商的 `maxOutputTokens` 限制（預設 4096，約數千字）。
 - CJK 字型：PDF 內建字型沒有中文字，resvg 在沒有 fontconfig 的主機上也找不到任何系統字型，會讓 SVG 文字整段消失，因此兩者共用一個明確指定的 CJK 字型。省略 `cjkFont` 時自動尋找 Noto Sans CJK（Debian/Ubuntu `apt install fonts-noto-cjk`、Arch、Fedora 的標準路徑）與 macOS 的 Hiragino Sans GB；也可設定 `cjkFont: { file, name }`，相對路徑以設定檔目錄為基準，`.ttc`／`.otc` 字型集合必須指定 PostScript 名稱。SVG 只載入這個字型並以它代替所有字型家族，略過系統字型掃描（本機實測由約 0.3～2.8 秒降到約 20 ms），代價是字型沒有的字元（例如彩色 emoji）不會顯示。都找不到時 PDF 停用（記錄 `pdf_unavailable`）、SVG 改用系統字型，文字檔不受影響；`./start.sh --check` 會顯示使用的字型。
 - 圖片或檔案無法產生、被拒絕或上傳失敗時，語喵會以引用原訊息的一句話告知（例如「目前無法產生 PDF，可以改用 txt 或 md。」），記錄對應代碼，且該回合不寫入上下文。
 
@@ -173,3 +189,5 @@ API 自檢改善：98 項測試通過，涵蓋歷史／管理員共用限流、�
 CJK 字型與失敗提示：144 項測試通過，涵蓋圖片與檔案各種失敗代碼的群組提示、缺少字型時的 `pdf_unavailable`，以及 `cjkFont` 設定驗證。正式主機（Ubuntu 26.04）原本沒有任何字型，PDF 一律 `file_unavailable`；安裝 `fonts-noto-cjk` 後 `--check` 偵測到 Noto Sans CJK，主機上實際排出 PDF；同時發現主機沒有 fontconfig 時 resvg 即使有字型也畫不出 SVG 文字，改為明確載入字型後文字正常出現。尚未以真實 Claude 或 LINE 驗證送達。
 
 先回應再產生檔案：144 項測試通過，涵蓋確認文字在檔案內容寫完前送出、空白回覆改用固定確認文字、第二次請求使用 `write_file` 工具並帶入檔名與 PDF 不用 Markdown 的指示、檔名無效或缺 PDF 字型時不發出第二次請求，以及內容產生失敗的群組提示。尚未以真實 Claude 或 LINE 驗證。
+
+OpenAI 主要、Claude 備用：149 項測試通過，涵蓋 OpenAI 的 `input_tokens` 計數與生成內容一致、Bearer 標頭且不壓縮、`reasoning`／`store`／強制 function call、略過推理項目、`null` 選填欄位、輸出截斷與格式錯誤、Images API 的 JPEG 產生與格式檢查、`write_file` 檔案內容；主要供應商失敗時改用備用並記錄代碼、同回合圖片不再重試已失敗的供應商、圖片 400 不切換、取消不切換；設定的 `provider` 預設值與 OpenAI 欄位驗證；機器人端 JPEG 原樣上傳與 `image_rejected` 提示。依 OpenAI 官方文件撰寫請求格式，尚未以真實 OpenAI API 驗證。

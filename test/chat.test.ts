@@ -5,7 +5,7 @@ import { once } from 'node:events';
 import { setImmediate } from 'node:timers/promises';
 import type { Transform, TransformCallback } from 'node:stream';
 import { createGzip, gunzipSync } from 'node:zlib';
-import { ChatEngine, ChatError } from '../src/chat.js';
+import { ChatEngine, ChatError, type ChatEngineOptions } from '../src/chat.js';
 import { isRecord } from '../src/guards.js';
 import type { ChatFetchOptions, ChatMessage, PreparedTurn } from '../src/chat.js';
 import type { ClaudeConfig } from '../src/config.js';
@@ -873,7 +873,7 @@ test('draw decisions acknowledge first, then draw with the decision context in a
   assert.equal(turn.text, '收到，正在畫圖，請稍等。');
   assert.ok(turn.draw);
   assert.equal(generations().length, 1);
-  assert.equal(await turn.draw(new AbortController().signal), '<svg/>');
+  assert.deepEqual(await turn.draw(new AbortController().signal), { svg: '<svg/>' });
   const request = generations()[1].body;
   assert.deepEqual(request.messages.map(message => message.content), ['draw']);
   assert.match(request.system.at(-1)?.text ?? '', /一隻灰貓/);
@@ -931,4 +931,155 @@ test('file decisions acknowledge first, then write the body in a second request'
   }
   input = { shouldReply: false, reply: '', file: { name: 'a.txt', description: 'x' } };
   await assert.rejects(engine.prepare('chat', 'bad'), hasCode('INVALID_RESPONSE'));
+});
+
+const openai = {
+  ...claude, apiKey: 'openai-secret-key', model: 'gpt-6-luna', reasoningEffort: 'none',
+  imageModel: 'gpt-image-2.5-flare', imageQuality: 'low', imageTimeoutMs: 1_000,
+};
+const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 7]);
+
+interface ProviderCall {
+  url: string;
+  headers: Record<string, string>;
+  body: Record<string, unknown>;
+}
+
+function providers(respond: (call: ProviderCall) => unknown, options: Partial<ChatEngineOptions> = {}) {
+  const calls: ProviderCall[] = [];
+  const logs: string[] = [];
+  const engine = new ChatEngine({
+    openai, system: 'Always be a helpful cat.', log: code => logs.push(code), ...options,
+    fetchImpl: async (url, options) => {
+      const json = options.headers['content-encoding'] === 'gzip'
+        ? gunzipSync(options.body).toString('utf8')
+        : typeof options.body === 'string' ? options.body : Buffer.from(options.body).toString('utf8');
+      const body: unknown = JSON.parse(json);
+      assert.ok(isRecord(body));
+      const call = { url, headers: options.headers, body };
+      calls.push(call);
+      const result = await respond(call);
+      return result instanceof Response ? result : Response.json(result);
+    },
+  });
+  return { engine, calls, logs };
+}
+
+/** A completed Responses API result whose function call follows a reasoning item. */
+function functionCall(name: string, input: unknown) {
+  return { status: 'completed', output: [
+    { type: 'reasoning', id: 'rs_1', summary: [] },
+    { type: 'function_call', id: 'fc_1', call_id: 'call_1', name, arguments: JSON.stringify(input) },
+  ] };
+}
+
+const toolName = (body: Record<string, unknown>) => isRecord(body.tool_choice) ? body.tool_choice.name : undefined;
+
+test('OpenAI counts, decides, draws JPEGs and writes files through its own APIs', async () => {
+  let decision: unknown = { shouldReply: true, reply: '畫給你', draw: '一隻灰貓', file: null };
+  let image: unknown = { data: [{ b64_json: JPEG.toString('base64') }] };
+  let generated: unknown;
+  const { engine, calls } = providers(({ url, body }) => {
+    if (url.endsWith('/responses/input_tokens')) return { object: 'response.input_tokens', input_tokens: 20 };
+    if (url.endsWith('/images/generations')) return image;
+    return generated ?? (toolName(body) === 'write_file' ? functionCall('write_file', { content: '內容' }) : functionCall('conversation_reply', decision));
+  });
+  const turn = requireTurn(await engine.prepare('chat', 'draw'));
+  // An omitted optional field spelled as null is accepted as absent.
+  assert.deepEqual([turn.text, turn.file], ['畫給你', undefined]);
+  const [count, decide] = calls;
+  assert.deepEqual(calls.map(call => call.url), ['https://api.openai.com/v1/responses/input_tokens', 'https://api.openai.com/v1/responses']);
+  for (const { headers } of calls) {
+    assert.deepEqual(headers, { authorization: 'Bearer openai-secret-key', 'content-type': 'application/json' });
+  }
+  assert.deepEqual(decide.body.input, [{ role: 'user', content: 'draw' }]);
+  assert.match(String(decide.body.instructions), /^Always be a helpful cat\.\n/);
+  assert.deepEqual([decide.body.model, decide.body.tool_choice, decide.body.parallel_tool_calls, decide.body.reasoning, decide.body.max_output_tokens, decide.body.store],
+    ['gpt-6-luna', { type: 'function', name: 'conversation_reply' }, false, { effort: 'none' }, 10, false]);
+  assert.ok(Array.isArray(decide.body.tools) && isRecord(decide.body.tools[0]) && decide.body.tools[0].strict === false);
+  // The count covers exactly the generated input, without generation-only fields.
+  const { max_output_tokens: _limit, store: _store, ...counted } = decide.body;
+  assert.deepEqual(count.body, counted);
+
+  assert.ok(turn.draw);
+  assert.deepEqual(await turn.draw(new AbortController().signal), { jpeg: JPEG });
+  assert.deepEqual(calls[2].body, { model: 'gpt-image-2.5-flare', prompt: '一隻灰貓', n: 1, size: '1024x1024', quality: 'low', output_format: 'jpeg' });
+  image = { data: [{ b64_json: Buffer.from('\x89PNG').toString('base64') }] };
+  await assert.rejects(turn.draw(new AbortController().signal), hasCode('INVALID_RESPONSE'));
+
+  decision = { shouldReply: true, reply: '', file: { name: 'a.txt', description: '清單' } };
+  const file = requireTurn(await engine.prepare('chat', 'file')).file;
+  assert.ok(file);
+  assert.equal(await file.write(new AbortController().signal), '內容');
+  assert.equal(toolName(calls.at(-1)?.body ?? {}), 'write_file');
+
+  generated = { status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' }, output: [] };
+  await assert.rejects(engine.prepare('chat', 'long'), hasCode('OUTPUT_TRUNCATED'));
+  const call = functionCall('conversation_reply', { shouldReply: true, reply: 'x' });
+  for (const bad of [
+    { ...call, output: [...call.output, call.output[1]] },
+    { ...call, status: 'failed' },
+    { ...call, output: [{ ...call.output[1], arguments: '{' }] },
+  ]) {
+    generated = bad;
+    await assert.rejects(engine.prepare('chat', 'bad'), hasCode('INVALID_RESPONSE'));
+  }
+});
+
+test('a failing primary falls back to the other provider, which also serves that turn\'s media', async () => {
+  let openaiStatus = 500;
+  let imageStatus = 200;
+  const { engine, calls, logs } = providers(({ url, body }) => {
+    if (url.startsWith('https://api.openai.com/')) {
+      if (url.endsWith('/images/generations')) {
+        return imageStatus === 200 ? { data: [{ b64_json: JPEG.toString('base64') }] } : new Response('{}', { status: imageStatus });
+      }
+      if (openaiStatus !== 200) return new Response('{}', { status: openaiStatus });
+      if (url.endsWith('/input_tokens')) return { input_tokens: 20 };
+      return functionCall('conversation_reply', { shouldReply: true, reply: 'openai', draw: '貓' });
+    }
+    if (url.endsWith('/count_tokens')) return { input_tokens: 20 };
+    return { stop_reason: 'tool_use', content: [toolName(body) === 'draw_svg'
+      ? { type: 'tool_use', id: 'toolu_draw', name: 'draw_svg', input: { svg: '<svg/>' } }
+      : { type: 'tool_use', id: 'toolu_reply', name: 'conversation_reply', input: { shouldReply: true, reply: 'claude', draw: '貓' } }] };
+  }, { claude });
+  const turn = requireTurn(await engine.prepare('chat', 'draw'));
+  assert.equal(turn.text, 'claude');
+  assert.deepEqual(logs, ['openai_fallback:COUNT_FAILED:500']);
+  assert.ok(turn.draw);
+  // OpenAI already failed this turn, so the picture is drawn by Claude without retrying it.
+  assert.deepEqual(await turn.draw(new AbortController().signal), { svg: '<svg/>' });
+  assert.ok(!calls.some(call => call.url.endsWith('/images/generations')));
+
+  openaiStatus = 200;
+  const drawing = requireTurn(await engine.prepare('chat', 'draw again')).draw;
+  assert.ok(drawing);
+  imageStatus = 500;
+  assert.deepEqual(await drawing(new AbortController().signal), { svg: '<svg/>' });
+  assert.equal(logs.at(-1), 'openai_fallback:GENERATION_FAILED:500');
+  // A rejected prompt is not redrawn elsewhere, which would sidestep the provider's moderation.
+  imageStatus = 400;
+  const before = calls.length;
+  await assert.rejects(drawing(new AbortController().signal), hasCode('IMAGE_REJECTED', 400));
+  assert.equal(calls.length, before + 1);
+
+  const controller = new AbortController();
+  const aborting = providers(() => {
+    controller.abort();
+    return { input_tokens: 20 };
+  }, { claude });
+  await assert.rejects(aborting.engine.prepare('chat', 'stop', controller.signal), hasCode('ABORTED'));
+  assert.equal(aborting.calls.length, 1);
+});
+
+test('provider selects the primary and must name a configured section', async () => {
+  const { engine, calls, logs } = providers(({ url }) => url.startsWith('https://api.anthropic.com/')
+    ? new Response('{}', { status: 529 })
+    : url.endsWith('/input_tokens') ? { input_tokens: 20 } : functionCall('conversation_reply', { shouldReply: true, reply: 'openai' }),
+  { claude, provider: 'claude' });
+  assert.equal(requireTurn(await engine.prepare('chat', 'hi')).text, 'openai');
+  assert.equal(new URL(calls[0].url).host, 'api.anthropic.com');
+  assert.deepEqual(logs, ['claude_fallback:COUNT_FAILED:529']);
+  assert.throws(() => new ChatEngine({ provider: 'openai', claude, system: '' }), hasCode('INVALID_CONFIG'));
+  assert.throws(() => new ChatEngine({ system: '' }), hasCode('INVALID_CONFIG'));
 });

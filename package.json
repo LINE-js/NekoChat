@@ -2,7 +2,7 @@
   "name": "nekochat",
   "version": "1.0.0",
   "private": true,
-  "description": "Claude chat extension for the LINE.js /api/ws bot API",
+  "description": "OpenAI/Claude chat extension for the LINE.js /api/ws bot API",
   "type": "module",
   "license": "Apache-2.0",
   "engines": {

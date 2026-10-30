@@ -1,7 +1,7 @@
 import WebSocket from 'ws';
 import { randomUUID } from 'node:crypto';
 import type { LineConfig, CjkFont } from './config.js';
-import type { ChatEngineLike } from './chat.js';
+import type { ChatEngineLike, DrawnImage } from './chat.js';
 import { isRecord } from './guards.js';
 import { renderSvg } from './image.js';
 import { renderPdf } from './document.js';
@@ -133,6 +133,7 @@ const MEDIA_NOTICES: Record<string, string> = {
   image_unsafe: '這張圖沒有畫成功，請換個說法再試一次。',
   image_invalid: '這張圖沒有畫成功，請換個說法再試一次。',
   image_failed: '圖片沒有送出成功，請稍後再試。',
+  image_rejected: '這張圖沒辦法畫，請換個主題或說法。',
   file_unavailable: '目前無法傳送檔案。',
   pdf_unavailable: '目前無法產生 PDF，可以改用 txt 或 md。',
   file_invalid: '檔案格式有誤，沒有送出。',
@@ -659,12 +660,14 @@ export class ChatBot {
     }
   }
 
-  async uploadImage(draw: (signal: AbortSignal) => Promise<string>, signal: AbortSignal): Promise<string> {
+  async uploadImage(draw: (signal: AbortSignal) => Promise<DrawnImage>, signal: AbortSignal): Promise<string> {
     if (!this.capabilities.has('media:upload')) throw failure('image_unavailable');
-    let svg: string;
-    try { svg = await draw(signal); }
-    catch { throw failure(signal.aborted ? 'cancelled' : 'image_failed'); }
-    return this.upload(renderSvg(svg, this.config.cjkFont), { 'content-type': 'image/png' }, 'image_failed', signal);
+    let image: DrawnImage;
+    try { image = await draw(signal); }
+    catch (error) { throw failure(signal.aborted ? 'cancelled' : codeOf(error) === 'IMAGE_REJECTED' ? 'image_rejected' : 'image_failed'); }
+    return 'jpeg' in image
+      ? this.upload(image.jpeg, { 'content-type': 'image/jpeg' }, 'image_failed', signal)
+      : this.upload(renderSvg(image.svg, this.config.cjkFont), { 'content-type': 'image/png' }, 'image_failed', signal);
   }
 
   async uploadFile({ name, write }: { name: string; write: (signal: AbortSignal) => Promise<string> }, signal: AbortSignal): Promise<string> {

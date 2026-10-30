@@ -1,11 +1,14 @@
 import { constants, createGzip } from 'node:zlib';
-import type { ClaudeConfig } from './config.js';
+import type { ClaudeConfig, OpenAIConfig, Provider } from './config.js';
 import { isRecord } from './guards.js';
+
+/** Claude draws SVG that the bot renders; OpenAI returns a finished JPEG. */
+export type DrawnImage = { svg: string } | { jpeg: Buffer<ArrayBuffer> };
 
 export interface PreparedTurn {
   text: string;
-  /** Generates the requested picture as SVG; called after the acknowledging text is sent. */
-  draw?: (signal: AbortSignal) => Promise<string>;
+  /** Generates the requested picture; called after the acknowledging text is sent. */
+  draw?: (signal: AbortSignal) => Promise<DrawnImage>;
   /** Attachment the bot uploads after the text (and image); the name selects the format and write() produces the body. */
   file?: { name: string; write: (signal: AbortSignal) => Promise<string> };
   commit(): void;
@@ -39,9 +42,14 @@ export interface ChatFetchOptions {
 export type ChatFetch = (url: string, options: ChatFetchOptions) => Promise<ChatFetchResponse>;
 
 export interface ChatEngineOptions {
-  claude: ClaudeConfig;
+  /** Defaults to openai when configured; the other configured provider is the fallback. */
+  provider?: Provider;
+  openai?: OpenAIConfig;
+  claude?: ClaudeConfig;
   system: string;
   fetchImpl?: ChatFetch;
+  /** Receives a safe code whenever a provider fails and the next one takes over. */
+  log?: (code: string) => void;
 }
 
 export interface ChatMessage {
@@ -54,9 +62,17 @@ interface ChatState {
   revision: number;
 }
 
+type Backend = { name: 'claude'; config: ClaudeConfig } | { name: 'openai'; config: OpenAIConfig };
 
+interface Tool {
+  name: string;
+  description: string;
+  input_schema: Record<string, unknown>;
+}
 
-const API_ROOT = 'https://api.anthropic.com/v1';
+const CLAUDE_API = 'https://api.anthropic.com/v1';
+const OPENAI_API = 'https://api.openai.com/v1';
+const EPHEMERAL = { type: 'ephemeral' } as const;
 const MAX_CONTEXT_TOKENS = 100_000;
 const COMPRESS_MIN_BYTES = 4096;
 
@@ -124,7 +140,7 @@ const REPLY_TOOL = {
       reply: { type: 'string', description: 'Natural chat reply when shouldReply is true; otherwise an empty string.' },
       draw: {
         type: 'string',
-        description: 'Only when asked to draw or create a picture: a concise description of the picture. It is drawn after your reply is sent, so reply must briefly acknowledge that you are starting to draw and must not claim it is finished. Omit otherwise.',
+        description: 'Only when asked to draw or create a picture: a self-contained description of the picture (subject, style, composition and any text it shows), usable without the conversation. It is drawn after your reply is sent, so reply must briefly acknowledge that you are starting to draw and must not claim it is finished. Omit otherwise.',
       },
       file: {
         type: 'object',
@@ -141,7 +157,6 @@ const REPLY_TOOL = {
     additionalProperties: false,
   },
 };
-const REPLY_CHOICE = { type: 'tool', name: REPLY_TOOL.name, disable_parallel_tool_use: true };
 const FOLLOWUP_SYSTEM = `
 This is an untriggered group message, not a direct request to 語喵. Decide whether the latest
 member message meaningfully continues or responds to the retained conversation with 語喵.
@@ -165,7 +180,6 @@ const DRAW_TOOL = {
     additionalProperties: false,
   },
 };
-const DRAW_CHOICE = { type: 'tool', name: DRAW_TOOL.name, disable_parallel_tool_use: true };
 const DRAW_SYSTEM = `
 You already told the member you are drawing. Draw the picture requested in the latest message,
 as described below, in your usual style. Call draw_svg exactly once; it is rendered to PNG and sent.
@@ -183,7 +197,6 @@ const WRITE_TOOL = {
     additionalProperties: false,
   },
 };
-const WRITE_CHOICE = { type: 'tool', name: WRITE_TOOL.name, disable_parallel_tool_use: true };
 const writeSystem = (name: string, description: string) => `
 You already told the member you are preparing a file. Write the complete body of ${JSON.stringify(name)}
 requested in the latest message, as described below. ${name.toLowerCase().endsWith('.pdf')
@@ -228,28 +241,72 @@ export class ChatError extends Error {
   }
 }
 
+/** Extracts the forced tool call's arguments from either provider's response. */
+function toolInput(backend: Backend, result: unknown, name: string): Record<string, unknown> {
+  if (backend.name === 'claude') {
+    if (isRecord(result) && result.stop_reason === 'max_tokens') throw new ChatError('OUTPUT_TRUNCATED');
+    const content: unknown = isRecord(result) ? result.content : undefined;
+    const block: unknown = Array.isArray(content) && content.length === 1 ? content[0] : undefined;
+    if (
+      !isRecord(result) || result.stop_reason !== 'tool_use' ||
+      !isRecord(block) || block.type !== 'tool_use' || block.name !== name ||
+      typeof block.id !== 'string' || !block.id.trim() || !isRecord(block.input)
+    ) {
+      throw new ChatError('INVALID_RESPONSE');
+    }
+    return block.input;
+  }
+  if (isRecord(result) && isRecord(result.incomplete_details) && result.incomplete_details.reason === 'max_output_tokens') {
+    throw new ChatError('OUTPUT_TRUNCATED');
+  }
+  // Reasoning items may precede the call; only function calls carry the answer.
+  const calls = isRecord(result) && Array.isArray(result.output)
+    ? result.output.filter((item: unknown) => isRecord(item) && item.type === 'function_call') : [];
+  const call: unknown = calls.length === 1 ? calls[0] : undefined;
+  let input: unknown;
+  try {
+    if (isRecord(call) && call.name === name && typeof call.arguments === 'string') input = JSON.parse(call.arguments);
+  } catch { /* Malformed arguments are reported below. */ }
+  if (!isRecord(result) || result.status !== 'completed' || !isRecord(input)) throw new ChatError('INVALID_RESPONSE');
+  return input;
+}
+
 export class ChatEngine implements ChatEngineLike {
-  #claude: ClaudeConfig;
+  /** Primary first; a later provider only runs after an earlier one failed. */
+  #backends: Backend[];
+  #personality: string;
   #system: { type: 'text'; text: string; cache_control: { type: 'ephemeral' } }[];
   #fetch: ChatFetch;
+  #log: (code: string) => void;
   #chats = new Map<string, ChatState>();
 
-  constructor({ claude, system, fetchImpl = globalThis.fetch }: ChatEngineOptions) {
+  constructor({ provider, openai, claude, system, fetchImpl = globalThis.fetch, log = () => {} }: ChatEngineOptions) {
+    const valid = (config: ClaudeConfig) =>
+      typeof config.apiKey === 'string' && config.apiKey.trim().length > 0 &&
+      typeof config.model === 'string' && config.model.trim().length > 0 &&
+      Number.isInteger(config.contextTokens) && config.contextTokens > 0 &&
+      config.contextTokens <= MAX_CONTEXT_TOKENS &&
+      Number.isInteger(config.maxOutputTokens) && config.maxOutputTokens > 0 &&
+      config.maxOutputTokens < config.contextTokens &&
+      Number.isInteger(config.timeoutMs) && config.timeoutMs > 0;
+    const backends: Backend[] = [];
+    if (openai) backends.push({ name: 'openai', config: { ...openai } });
+    if (claude) backends.push({ name: 'claude', config: { ...claude } });
+    if ((provider ?? backends[0]?.name) === 'claude') backends.reverse();
     if (
-      !claude || typeof claude.apiKey !== 'string' || !claude.apiKey.trim() ||
-      typeof claude.model !== 'string' || !claude.model.trim() ||
-      !Number.isInteger(claude.contextTokens) || claude.contextTokens <= 0 ||
-      claude.contextTokens > MAX_CONTEXT_TOKENS ||
-      !Number.isInteger(claude.maxOutputTokens) || claude.maxOutputTokens <= 0 ||
-      claude.maxOutputTokens >= claude.contextTokens ||
-      !Number.isInteger(claude.timeoutMs) || claude.timeoutMs <= 0 ||
-      typeof system !== 'string' || typeof fetchImpl !== 'function'
+      backends.length === 0 || (provider !== undefined && backends[0].name !== provider) ||
+      !backends.every(backend => valid(backend.config)) ||
+      (openai !== undefined && (typeof openai.imageModel !== 'string' || !openai.imageModel.trim() ||
+        typeof openai.imageQuality !== 'string' || !Number.isInteger(openai.imageTimeoutMs) || openai.imageTimeoutMs <= 0)) ||
+      typeof system !== 'string' || typeof fetchImpl !== 'function' || typeof log !== 'function'
     ) {
       throw new ChatError('INVALID_CONFIG');
     }
-    this.#claude = { ...claude };
-    this.#system = system ? [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }] : [];
+    this.#backends = backends;
+    this.#personality = system;
+    this.#system = system ? [{ type: 'text', text: system, cache_control: EPHEMERAL }] : [];
     this.#fetch = fetchImpl;
+    this.#log = log;
   }
 
   clear(chatId: string): void {
@@ -260,8 +317,8 @@ export class ChatEngine implements ChatEngineLike {
     this.#chats.clear();
   }
 
-  /** One deadline-bound unit of API work; dispose() must run when it ends. */
-  #session(signal?: AbortSignal) {
+  /** One deadline-bound unit of API work against one provider; dispose() must run when it ends. */
+  #session(backend: Backend, timeoutMs: number, signal?: AbortSignal) {
     const controller = new AbortController();
     let timedOut = false;
     const onAbort = () => controller.abort();
@@ -269,26 +326,24 @@ export class ChatEngine implements ChatEngineLike {
     const timer = setTimeout(() => {
       timedOut = true;
       controller.abort();
-    }, this.#claude.timeoutMs);
+    }, timeoutMs);
 
     const checkAbort = () => {
       if (signal?.aborted) throw new ChatError('ABORTED');
       if (timedOut) throw new ChatError('TIMEOUT');
     };
-    const request = async (endpoint: string, body: unknown, failureCode: string): Promise<unknown> => {
+    const request = async (url: string, body: unknown, failureCode: string): Promise<unknown> => {
       checkAbort();
       let response: ChatFetchResponse | undefined;
       try {
         const json = JSON.stringify(body);
         const bytes = Buffer.byteLength(json);
         let payload: ChatFetchOptions['body'] = json;
-        const headers: Record<string, string> = {
-          'x-api-key': this.#claude.apiKey,
-          'anthropic-version': '2023-06-01',
-          'content-type': 'application/json',
-        };
-        // Avoid blocking other chats or making small/incompressible uploads larger.
-        if (bytes >= COMPRESS_MIN_BYTES) {
+        const headers: Record<string, string> = backend.name === 'claude'
+          ? { 'x-api-key': backend.config.apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' }
+          : { authorization: `Bearer ${backend.config.apiKey}`, 'content-type': 'application/json' };
+        // Only Anthropic documents gzip request bodies. Avoid blocking other chats or making small/incompressible uploads larger.
+        if (backend.name === 'claude' && bytes >= COMPRESS_MIN_BYTES) {
           const compressed = await compress(json, controller.signal);
           if (compressed.byteLength < bytes) {
             payload = compressed;
@@ -296,7 +351,7 @@ export class ChatEngine implements ChatEngineLike {
           }
         }
         checkAbort();
-        response = await this.#fetch(`${API_ROOT}/${endpoint}`, {
+        response = await this.#fetch(url, {
           method: 'POST',
           headers,
           body: payload,
@@ -322,6 +377,48 @@ export class ChatEngine implements ChatEngineLike {
     return { request, dispose };
   }
 
+  /** One forced tool call; the personality comes first so both providers can reuse its cached prefix. */
+  #toolRequest(backend: Backend, instruction: string, tool: Tool, messages: ChatMessage[], generate: boolean, decision: boolean) {
+    const { config } = backend;
+    if (backend.name === 'claude') {
+      return {
+        url: `${CLAUDE_API}/messages${generate ? '' : '/count_tokens'}`,
+        body: {
+          model: config.model,
+          // Keep the personality cache reusable when the trigger mode or chat changes.
+          system: [...this.#system, { type: 'text', text: instruction, ...(decision ? { cache_control: EPHEMERAL } : {}) }],
+          tools: [tool], tool_choice: { type: 'tool', name: tool.name, disable_parallel_tool_use: true },
+          messages,
+          ...(generate ? { max_tokens: config.maxOutputTokens, ...(decision ? { cache_control: EPHEMERAL } : {}) } : {}),
+        },
+      };
+    }
+    return {
+      url: `${OPENAI_API}/responses${generate ? '' : '/input_tokens'}`,
+      body: {
+        model: config.model,
+        instructions: this.#personality ? `${this.#personality}\n${instruction}` : instruction,
+        input: messages,
+        // Strict mode requires every property, but the decision's draw and file fields are optional.
+        tools: [{ type: 'function', name: tool.name, description: tool.description, parameters: tool.input_schema, strict: false }],
+        tool_choice: { type: 'function', name: tool.name }, parallel_tool_calls: false,
+        ...(backend.config.reasoningEffort ? { reasoning: { effort: backend.config.reasoningEffort } } : {}),
+        ...(generate ? { max_output_tokens: config.maxOutputTokens, store: false } : {}),
+      },
+    };
+  }
+
+  /** Runs on each remaining provider in order; cancellation and rejected image prompts never fall back. */
+  async #fallback<T>(backends: Backend[], run: (backend: Backend, chain: Backend[]) => Promise<T>): Promise<T> {
+    try {
+      return await run(backends[0], backends);
+    } catch (error) {
+      if (backends.length === 1 || !(error instanceof ChatError) || error.code === 'ABORTED' || error.code === 'IMAGE_REJECTED') throw error;
+      this.#log(`${backends[0].name}_fallback:${error.code}${error.status === undefined ? '' : `:${error.status}`}`);
+      return this.#fallback(backends.slice(1), run);
+    }
+  }
+
   async prepare(chatId: string, input: string, signal?: AbortSignal, { followup = false, owner = false }: PrepareOptions = {}): Promise<PreparedTurn | null> {
     if (typeof chatId !== 'string' || !chatId || typeof input !== 'string' || !input.trim()) {
       throw new ChatError('INVALID_INPUT');
@@ -333,35 +430,91 @@ export class ChatEngine implements ChatEngineLike {
       state = { messages: [], revision: 0 };
       this.#chats.set(chatId, state);
     }
-    const revision = state.revision;
-    if (followup && state.messages.length === 0) return null;
-    const { request, dispose } = this.#session(signal);
-    try {
-      const user: ChatMessage = { role: 'user', content: input };
-      const history = state.messages;
-      const pairCount = history.length / 2;
-      const requestOptions = {
-        model: this.#claude.model,
-        // Keep the personality cache reusable when the trigger mode or chat changes.
-        system: [...this.#system, {
-          type: 'text', text: owner ? OWNER_SYSTEM : `${followup ? FOLLOWUP_SYSTEM : DIRECT_SYSTEM}\n${DECISION_SYSTEM}`,
-          cache_control: { type: 'ephemeral' },
-        }],
-        tools: [REPLY_TOOL], tool_choice: REPLY_CHOICE,
+    const chat = state;
+    const revision = chat.revision;
+    const history = chat.messages;
+    if (followup && history.length === 0) return null;
+    const user: ChatMessage = { role: 'user', content: input };
+    const instruction = owner ? OWNER_SYSTEM : `${followup ? FOLLOWUP_SYSTEM : DIRECT_SYSTEM}\n${DECISION_SYSTEM}`;
+    return this.#fallback(this.#backends, async (backend, chain) => {
+      const decided = await this.#decide(backend, instruction, history, user, followup, signal);
+      if (!decided) return null;
+      const { messages, decision } = decided;
+      // Non-strict OpenAI calls may spell an omitted optional field as null.
+      for (const key of ['draw', 'file']) if (decision[key] === null) delete decision[key];
+      const draw: unknown = decision.draw;
+      const file: unknown = decision.file;
+      if (
+        Object.keys(decision).length !== 2 + Number(draw !== undefined) + Number(file !== undefined) ||
+        typeof decision.shouldReply !== 'boolean' || typeof decision.reply !== 'string' ||
+        (draw !== undefined && (typeof draw !== 'string' || !draw.trim() || !decision.shouldReply)) ||
+        (file !== undefined && (!isRecord(file) || Object.keys(file).length !== 2 ||
+          typeof file.name !== 'string' || typeof file.description !== 'string' || !file.description.trim() ||
+          !decision.shouldReply)) ||
+        (!decision.shouldReply && decision.reply !== '')
+      ) {
+        throw new ChatError('INVALID_RESPONSE');
+      }
+      if (!decision.shouldReply) {
+        if (owner) throw new ChatError('INVALID_RESPONSE');
+        return null;
+      }
+      const name = isRecord(file) && typeof file.name === 'string' ? file.name : undefined;
+      const brief = isRecord(file) && typeof file.description === 'string' ? file.description : '';
+      // Pictures and files take a while; members must see an acknowledgement before they arrive.
+      const text = decision.reply.trim() ? decision.reply
+        : name !== undefined ? '收到，正在準備檔案，請稍等。'
+        : typeof draw === 'string' ? '收到，正在畫圖，請稍等。' : '';
+      if (!text) throw new ChatError('INVALID_RESPONSE');
+      // Retain only markers: image data and file bodies would inflate every later request.
+      const retained = [text, draw === undefined ? '' : '（附上一張圖片）', name === undefined ? '' : `（附上檔案 ${name}）`]
+        .filter(Boolean).join('\n');
+      const completed: ChatMessage[] = [...messages, { role: 'assistant', content: retained }];
+      let committed = false;
+      // Media starts at the provider that decided; one that already failed this turn is not retried.
+      return {
+        text,
+        ...(typeof draw === 'string' ? {
+          draw: (drawSignal: AbortSignal) => this.#fallback(chain, artist => artist.name === 'openai'
+            ? this.#image(artist, draw, drawSignal)
+            : this.#produce(artist, `${DRAW_SYSTEM}\n${draw}`, DRAW_TOOL, 'svg', messages, drawSignal).then(svg => ({ svg }))),
+        } : {}),
+        ...(name !== undefined ? { file: {
+          name,
+          write: (writeSignal: AbortSignal) => this.#fallback(chain, writer =>
+            this.#produce(writer, writeSystem(name, brief), WRITE_TOOL, 'content', messages, writeSignal)),
+        } } : {}),
+        commit: () => {
+          if (
+            committed || signal?.aborted || this.#chats.get(chatId) !== chat ||
+            chat.revision !== revision
+          ) return;
+          committed = true;
+          chat.messages = completed;
+          chat.revision += 1;
+        },
       };
+    });
+  }
+
+  /** Counts, trims the oldest history to fit this provider's budget and asks for the decision. */
+  async #decide(
+    backend: Backend, instruction: string, history: ChatMessage[], user: ChatMessage, followup: boolean, signal?: AbortSignal,
+  ): Promise<{ messages: ChatMessage[]; decision: Record<string, unknown> } | null> {
+    const { request, dispose } = this.#session(backend, backend.config.timeoutMs, signal);
+    try {
+      const pairCount = history.length / 2;
       const messagesAfter = (droppedPairs: number): ChatMessage[] => [...history.slice(droppedPairs * 2), user];
       const count = async (messages: ChatMessage[]): Promise<number> => {
-        const result = await request('messages/count_tokens', {
-          ...requestOptions,
-          messages,
-        }, 'COUNT_FAILED');
+        const { url, body } = this.#toolRequest(backend, instruction, REPLY_TOOL, messages, false, true);
+        const result = await request(url, body, 'COUNT_FAILED');
         if (!isRecord(result) || typeof result.input_tokens !== 'number' || !Number.isSafeInteger(result.input_tokens) || result.input_tokens < 0) {
           throw new ChatError('COUNT_FAILED');
         }
         return result.input_tokens;
       };
 
-      const inputLimit = this.#claude.contextTokens - this.#claude.maxOutputTokens;
+      const inputLimit = backend.config.contextTokens - backend.config.maxOutputTokens;
       let messages = messagesAfter(0);
       const fullTokens = await count(messages);
       if (fullTokens > inputLimit) {
@@ -402,69 +555,8 @@ export class ChatEngine implements ChatEngineLike {
       // Without any retained exchange there is no evidence to judge a continuation.
       if (followup && messages.length === 1) return null;
 
-      const result = await request('messages', {
-        ...requestOptions,
-        messages,
-        max_tokens: this.#claude.maxOutputTokens,
-        cache_control: { type: 'ephemeral' },
-      }, 'GENERATION_FAILED');
-      if (isRecord(result) && result.stop_reason === 'max_tokens') throw new ChatError('OUTPUT_TRUNCATED');
-      const content: unknown = isRecord(result) ? result.content : undefined;
-      const block: unknown = Array.isArray(content) ? content[0] : undefined;
-      const decision: unknown = isRecord(block) ? block.input : undefined;
-      const draw: unknown = isRecord(decision) ? decision.draw : undefined;
-      const file: unknown = isRecord(decision) ? decision.file : undefined;
-      if (
-        !isRecord(result) || result.stop_reason !== 'tool_use' ||
-        !Array.isArray(content) || content.length !== 1 ||
-        !isRecord(block) || block.type !== 'tool_use' || block.name !== REPLY_TOOL.name ||
-        typeof block.id !== 'string' || !block.id.trim() ||
-        !isRecord(decision) ||
-        Object.keys(decision).length !== 2 + Number(draw !== undefined) + Number(file !== undefined) ||
-        typeof decision.shouldReply !== 'boolean' || typeof decision.reply !== 'string' ||
-        (draw !== undefined && (typeof draw !== 'string' || !draw.trim() || !decision.shouldReply)) ||
-        (file !== undefined && (!isRecord(file) || Object.keys(file).length !== 2 ||
-          typeof file.name !== 'string' || typeof file.description !== 'string' || !file.description.trim() ||
-          !decision.shouldReply)) ||
-        (!decision.shouldReply && decision.reply !== '')
-      ) {
-        throw new ChatError('INVALID_RESPONSE');
-      }
-      if (!decision.shouldReply) {
-        if (owner) throw new ChatError('INVALID_RESPONSE');
-        return null;
-      }
-      const name = isRecord(file) && typeof file.name === 'string' ? file.name : undefined;
-      const brief = isRecord(file) && typeof file.description === 'string' ? file.description : '';
-      // Pictures and files take a while; members must see an acknowledgement before they arrive.
-      const text = decision.reply.trim() ? decision.reply
-        : name !== undefined ? '收到，正在準備檔案，請稍等。'
-        : typeof draw === 'string' ? '收到，正在畫圖，請稍等。' : '';
-      if (!text) throw new ChatError('INVALID_RESPONSE');
-      // Retain only markers: SVG source and file bodies would inflate every later request.
-      const retained = [text, draw === undefined ? '' : '（附上一張圖片）', name === undefined ? '' : `（附上檔案 ${name}）`]
-        .filter(Boolean).join('\n');
-      const completed: ChatMessage[] = [...messages, { role: 'assistant', content: retained }];
-      let committed = false;
-      return {
-        text,
-        ...(typeof draw === 'string' ? {
-          draw: (drawSignal: AbortSignal) => this.#produce(`${DRAW_SYSTEM}\n${draw}`, DRAW_TOOL, DRAW_CHOICE, 'svg', messages, drawSignal),
-        } : {}),
-        ...(name !== undefined ? { file: {
-          name,
-          write: (writeSignal: AbortSignal) => this.#produce(writeSystem(name, brief), WRITE_TOOL, WRITE_CHOICE, 'content', messages, writeSignal),
-        } } : {}),
-        commit: () => {
-          if (
-            committed || signal?.aborted || this.#chats.get(chatId) !== state ||
-            state.revision !== revision
-          ) return;
-          committed = true;
-          state.messages = completed;
-          state.revision += 1;
-        },
-      };
+      const { url, body } = this.#toolRequest(backend, instruction, REPLY_TOOL, messages, true, true);
+      return { messages, decision: toolInput(backend, await request(url, body, 'GENERATION_FAILED'), REPLY_TOOL.name) };
     } finally {
       dispose();
     }
@@ -472,26 +564,42 @@ export class ChatEngine implements ChatEngineLike {
 
   /** Runs a follow-up request that must return one string field of a forced tool. */
   async #produce(
-    instruction: string, tool: { name: string }, choice: unknown, field: string, messages: ChatMessage[], signal: AbortSignal,
+    backend: Backend, instruction: string, tool: Tool, field: string, messages: ChatMessage[], signal: AbortSignal,
   ): Promise<string> {
     if (signal.aborted) throw new ChatError('ABORTED');
-    const { request, dispose } = this.#session(signal);
+    const { request, dispose } = this.#session(backend, backend.config.timeoutMs, signal);
     try {
       // Reuses the counted decision context: each follow-up tool is smaller than the decision tool.
-      const result = await request('messages', {
-        model: this.#claude.model,
-        system: [...this.#system, { type: 'text', text: instruction }],
-        tools: [tool], tool_choice: choice,
-        messages,
-        max_tokens: this.#claude.maxOutputTokens,
-      }, 'GENERATION_FAILED');
-      if (isRecord(result) && result.stop_reason === 'max_tokens') throw new ChatError('OUTPUT_TRUNCATED');
-      const content: unknown = isRecord(result) ? result.content : undefined;
-      const block: unknown = Array.isArray(content) && content.length === 1 ? content[0] : undefined;
-      const value: unknown = isRecord(block) && block.type === 'tool_use' && block.name === tool.name && isRecord(block.input)
-        ? block.input[field] : undefined;
+      const { url, body } = this.#toolRequest(backend, instruction, tool, messages, true, false);
+      const value = toolInput(backend, await request(url, body, 'GENERATION_FAILED'), tool.name)[field];
       if (typeof value !== 'string' || !value.trim()) throw new ChatError('INVALID_RESPONSE');
       return value;
+    } finally {
+      dispose();
+    }
+  }
+
+  /** Generates the picture with the OpenAI Images API from the decision's description. */
+  async #image(backend: Extract<Backend, { name: 'openai' }>, prompt: string, signal: AbortSignal): Promise<DrawnImage> {
+    if (signal.aborted) throw new ChatError('ABORTED');
+    const { request, dispose } = this.#session(backend, backend.config.imageTimeoutMs, signal);
+    try {
+      let result: unknown;
+      try {
+        result = await request(`${OPENAI_API}/images/generations`, {
+          model: backend.config.imageModel, prompt, n: 1, size: '1024x1024', quality: backend.config.imageQuality,
+          // JPEG is the fastest format to generate and keeps the LINE upload small.
+          output_format: 'jpeg',
+        }, 'GENERATION_FAILED');
+      } catch (error) {
+        // 400 includes moderation blocks; redrawing the same request elsewhere would sidestep them.
+        if (error instanceof ChatError && error.code === 'GENERATION_FAILED' && error.status === 400) throw new ChatError('IMAGE_REJECTED', 400);
+        throw error;
+      }
+      const data: unknown = isRecord(result) && Array.isArray(result.data) && result.data.length === 1 ? result.data[0] : undefined;
+      const jpeg = isRecord(data) && typeof data.b64_json === 'string' ? Buffer.from(data.b64_json, 'base64') : undefined;
+      if (!jpeg || jpeg[0] !== 0xff || jpeg[1] !== 0xd8 || jpeg[2] !== 0xff) throw new ChatError('INVALID_RESPONSE');
+      return { jpeg };
     } finally {
       dispose();
     }

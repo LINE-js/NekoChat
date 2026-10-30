@@ -32,6 +32,7 @@ export interface LineConfig {
   maxPendingTotal: number;
 }
 
+/** Shared by both providers; each section has its own budget and deadline. */
 export interface ClaudeConfig {
   apiKey: string;
   model: string;
@@ -40,13 +41,30 @@ export interface ClaudeConfig {
   timeoutMs: number;
 }
 
+export interface OpenAIConfig extends ClaudeConfig {
+  /** Omitted: the model's default effort. */
+  reasoningEffort?: string;
+  imageModel: string;
+  imageQuality: string;
+  /** Image generation takes far longer than a chat turn, so it has its own deadline. */
+  imageTimeoutMs: number;
+}
+
+export type Provider = 'openai' | 'claude';
+
 export interface Config {
   line: LineConfig;
-  claude: ClaudeConfig;
+  /** Primary provider; the other configured provider is the fallback. */
+  provider: Provider;
+  openai?: OpenAIConfig;
+  claude?: ClaudeConfig;
   personalityFile: string;
   /** CJK font embedded into PDFs and used for SVG text; PDFs are unavailable without one. */
   cjkFont?: CjkFont;
 }
+
+const REASONING_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+const IMAGE_QUALITIES = ['low', 'medium', 'high', 'xhigh', 'max', 'auto'];
 
 export class ConfigError extends Error {
   constructor(message: string) {
@@ -59,10 +77,34 @@ function requireValue(condition: unknown, message: string): asserts condition {
   if (!condition) throw new ConfigError(message);
 }
 
-
 function integer(value: unknown, min: number, max: number, field: string): asserts value is number {
   requireValue(typeof value === 'number' && Number.isSafeInteger(value) && value >= min && value <= max,
     `${field} 必須是 ${min}～${max} 的整數。`);
+}
+
+function modelConfig(section: Provider, raw: Record<string, unknown>): ClaudeConfig {
+  const { apiKey, model, contextTokens, maxOutputTokens, timeoutMs } = raw;
+  requireValue(typeof apiKey === 'string' && /^[\x21-\x7e]+$/.test(apiKey), `請填入 ${section}.apiKey。`);
+  requireValue(typeof model === 'string' && model.trim().length > 0, `請填入 ${section}.model。`);
+  integer(contextTokens, 1, 100000, `${section}.contextTokens`);
+  integer(maxOutputTokens, 1, contextTokens - 1, `${section}.maxOutputTokens`);
+  integer(timeoutMs, 1000, 300000, `${section}.timeoutMs`);
+  return { apiKey, model, contextTokens, maxOutputTokens, timeoutMs };
+}
+
+function openAIConfig(raw: Record<string, unknown>): OpenAIConfig {
+  const { reasoningEffort, imageModel = 'gpt-image-2.5-flare', imageQuality = 'medium', imageTimeoutMs = 120000 } = raw;
+  requireValue(reasoningEffort === undefined || (typeof reasoningEffort === 'string' && REASONING_EFFORTS.includes(reasoningEffort)),
+    `openai.reasoningEffort 必須是 ${REASONING_EFFORTS.join('、')} 之一，或省略。`);
+  requireValue(typeof imageModel === 'string' && imageModel.trim().length > 0, 'openai.imageModel 必須是模型名稱。');
+  requireValue(typeof imageQuality === 'string' && IMAGE_QUALITIES.includes(imageQuality),
+    `openai.imageQuality 必須是 ${IMAGE_QUALITIES.join('、')} 之一。`);
+  integer(imageTimeoutMs, 1000, 300000, 'openai.imageTimeoutMs');
+  return {
+    ...modelConfig('openai', raw),
+    ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+    imageModel, imageQuality, imageTimeoutMs,
+  };
 }
 
 export async function loadConfig(filename = 'config.yaml'): Promise<{ config: Config; system: string }> {
@@ -87,8 +129,8 @@ export async function loadConfig(filename = 'config.yaml'): Promise<{ config: Co
   }
 
   requireValue(isRecord(raw), '設定必須是鍵值物件。');
-  const { line, claude, personalityFile, cjkFont: rawCjkFont } = raw;
-  requireValue(isRecord(line) && isRecord(claude), '缺少 line 或 claude 設定。');
+  const { line, openai: rawOpenAI, claude: rawClaude, personalityFile, cjkFont: rawCjkFont } = raw;
+  requireValue(isRecord(line), '缺少 line 設定。');
   const { url: lineUrl, token, chats } = line;
   let url: URL;
   try {
@@ -120,12 +162,14 @@ export async function loadConfig(filename = 'config.yaml'): Promise<{ config: Co
   integer(maxPendingPerChat, 1, 10000, 'line.maxPendingPerChat');
   integer(maxPendingTotal, 1, 10000, 'line.maxPendingTotal');
   requireValue(maxPendingPerChat <= maxPendingTotal, 'line.maxPendingPerChat 不能大於 line.maxPendingTotal。');
-  const { apiKey, model, contextTokens, maxOutputTokens, timeoutMs } = claude;
-  requireValue(typeof apiKey === 'string' && /^[\x21-\x7e]+$/.test(apiKey), '請填入 claude.apiKey。');
-  requireValue(typeof model === 'string' && model.trim().length > 0, '請填入 claude.model。');
-  integer(contextTokens, 1, 100000, 'claude.contextTokens');
-  integer(maxOutputTokens, 1, contextTokens - 1, 'claude.maxOutputTokens');
-  integer(timeoutMs, 1000, 300000, 'claude.timeoutMs');
+  requireValue((rawOpenAI === undefined || isRecord(rawOpenAI)) && (rawClaude === undefined || isRecord(rawClaude))
+    && (rawOpenAI !== undefined || rawClaude !== undefined), '請設定 openai 或 claude，至少一個。');
+  const openai = rawOpenAI === undefined ? undefined : openAIConfig(rawOpenAI);
+  const claude = rawClaude === undefined ? undefined : modelConfig('claude', rawClaude);
+  // Older configs have only a claude section; it stays the primary without a provider key.
+  const provider = raw.provider ?? (openai ? 'openai' : 'claude');
+  requireValue((provider === 'openai' && openai) || (provider === 'claude' && claude),
+    'provider 必須是 openai 或 claude，且該段設定必須存在。');
   requireValue(typeof personalityFile === 'string' && personalityFile.trim().length > 0,
     '請填入 personalityFile。');
   let system: string;
@@ -152,7 +196,9 @@ export async function loadConfig(filename = 'config.yaml'): Promise<{ config: Co
   }
   const config: Config = {
     line: { url: lineUrl, token, chats, ownMemberIds, textMaxLength, sendsPerMinute, maxPendingPerChat, maxPendingTotal },
-    claude: { apiKey, model, contextTokens, maxOutputTokens, timeoutMs },
+    provider,
+    ...(openai ? { openai } : {}),
+    ...(claude ? { claude } : {}),
     personalityFile,
     ...(cjkFont ? { cjkFont } : {}),
   };

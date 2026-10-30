@@ -111,3 +111,32 @@ test('cjkFont resolves relative to the config and rejects unreadable files or un
     await assert.rejects(loadConfig(filename), /cjkFont/);
   }
 });
+
+test('provider picks the primary section, defaults keep old Claude configs, and OpenAI options are validated', async t => {
+  const { filename, config, save } = await fixture(t);
+  const raw: Record<string, unknown> = config;
+  const section = config.claude;
+  assert.equal((await loadConfig(filename)).config.provider, 'claude');
+  raw.openai = { ...section, apiKey: 'private-openai-value', model: 'gpt-6-luna' };
+  await save();
+  const loaded = (await loadConfig(filename)).config;
+  assert.equal(loaded.provider, 'openai');
+  assert.deepEqual([loaded.openai?.imageModel, loaded.openai?.imageQuality, loaded.openai?.imageTimeoutMs, loaded.openai?.reasoningEffort],
+    ['gpt-image-2.5-flare', 'medium', 120000, undefined]);
+  raw.provider = 'claude';
+  await save();
+  assert.equal((await loadConfig(filename)).config.provider, 'claude');
+  delete raw.claude;
+  await save();
+  await assert.rejects(loadConfig(filename), /provider/);
+  for (const [field, value] of [['reasoningEffort', 'fast'], ['imageQuality', 'ultra'], ['imageTimeoutMs', 0], ['apiKey', '']] as const) {
+    raw.provider = 'openai';
+    raw.openai = { ...section, model: 'gpt-6-luna', [field]: value };
+    await save();
+    await assert.rejects(loadConfig(filename), (error: unknown) => error instanceof Error && error.message.includes(`openai.${field}`)
+      && !error.message.includes(section.apiKey));
+  }
+  delete raw.openai;
+  await save();
+  await assert.rejects(loadConfig(filename), /openai 或 claude/);
+});

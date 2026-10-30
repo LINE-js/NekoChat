@@ -7,7 +7,7 @@ import { WebSocketServer, WebSocket, type RawData } from 'ws';
 import type { TestContext } from 'node:test';
 import { createServer, type IncomingHttpHeaders } from 'node:http';
 import type { LineConfig, CjkFont } from '../src/config.js';
-import type { ChatEngineLike, PreparedTurn, PrepareOptions } from '../src/chat.js';
+import { ChatError, type ChatEngineLike, type DrawnImage, type PreparedTurn, type PrepareOptions } from '../src/chat.js';
 import { isRecord } from '../src/guards.js';
 import { ChatBot, type LineMessage, type LineRequest } from '../src/bot.js';
 
@@ -1395,7 +1395,7 @@ const SYSTEM_CJK_FONT = [
   { file: '/System/Library/Fonts/Hiragino Sans GB.ttc', name: 'HiraginoSansGB-W3' },
 ].find(font => existsSync(font.file));
 
-async function imageFixture(t: TestContext, image: (text: string) => string, drawn?: Promise<void>) {
+async function imageFixture(t: TestContext, image: (text: string) => DrawnImage, drawn?: Promise<void>) {
   const commits: string[] = [];
   // A configured font skips resvg's slow system font scan.
   const f = await fixture(t, { cjkFont: SYSTEM_CJK_FONT, prepare: ({ chatId, input }) => {
@@ -1411,7 +1411,7 @@ async function imageFixture(t: TestContext, image: (text: string) => string, dra
 
 test('the acknowledgement is sent before drawing finishes, then the PNG is uploaded with the bot token', async t => {
   const finish = Promise.withResolvers<void>();
-  const { f, commits } = await imageFixture(t, () => SVG, finish.promise);
+  const { f, commits } = await imageFixture(t, () => ({ svg: SVG }), finish.promise);
   f.send({ type: 'hello', protocol: 2, capabilities: ['chat:admins', 'media:upload'] });
   f.send(message('caption'));
   await until(() => f.sends.length === 1);
@@ -1435,10 +1435,27 @@ test('the acknowledgement is sent before drawing finishes, then the PNG is uploa
   await until(() => commits.length === 2);
 });
 
+test('finished JPEGs from OpenAI upload unchanged, and rejected prompts get their own notice', async t => {
+  const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3]);
+  const { f, commits } = await imageFixture(t, text => {
+    if (text === '@rejected') throw new ChatError('IMAGE_REJECTED', 400);
+    return { jpeg };
+  });
+  f.send({ type: 'hello', protocol: 2, capabilities: ['chat:admins', 'media:upload'] });
+  f.send(message('photo'));
+  await until(() => commits.length === 1);
+  assert.equal(f.uploads[0].headers['content-type'], 'image/jpeg');
+  assert.deepEqual(f.uploads[0].body, jpeg);
+  f.send(message('rejected'));
+  await until(() => f.logs.includes('image_rejected'));
+  await until(() => f.sends.length === 1);
+  assert.deepEqual([f.sends[0].text, f.uploads.length, commits.length], ['這張圖沒辦法畫，請換個主題或說法。', 1, 1]);
+});
+
 test('failed drawing, unsafe SVGs, missing upload support and failed uploads are reported and skip the commit', async t => {
   const { f, commits } = await imageFixture(t, text => {
     if (text === '@broken') throw new Error('generation failed');
-    return text === '@unsafe' ? '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 4 4"><image href="/etc/secret.png" width="4" height="4"/></svg>' : SVG;
+    return { svg: text === '@unsafe' ? '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 4 4"><image href="/etc/secret.png" width="4" height="4"/></svg>' : SVG };
   });
   f.send(message('unsupported'));
   await until(() => f.logs.includes('image_unavailable'));

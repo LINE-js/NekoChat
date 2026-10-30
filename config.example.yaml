@@ -9,6 +9,24 @@ line:
   maxPendingPerChat: 50
   maxPendingTotal: 200
 
+# 主要供應商：openai 或 claude。另一段有設定時作為備用，主要供應商失敗時自動改用。
+# 省略時有 openai 段就用 openai，否則用 claude。
+provider: "openai"
+
+openai:
+  apiKey: ""
+  model: "gpt-6-luna"
+  # 省略時使用模型預設值；gpt-6-luna 支援 none，回覆最快。
+  reasoningEffort: "none"
+  contextTokens: 100000
+  maxOutputTokens: 4096
+  timeoutMs: 60000
+  imageModel: "gpt-image-2.5-flare"
+  # low、medium、high、xhigh、max 或 auto；越高越慢。
+  imageQuality: "medium"
+  imageTimeoutMs: 120000
+
+# 備用；不需要時可整段刪除。
 claude:
   apiKey: ""
   model: "claude-haiku-5-5"
