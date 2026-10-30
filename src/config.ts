@@ -44,6 +44,8 @@ export interface ClaudeConfig {
 export interface OpenAIConfig extends ClaudeConfig {
   /** Omitted: the model's default effort. */
   reasoningEffort?: string;
+  /** Omitted: the project's service tier. `fast` trades a per-token premium for lower latency. */
+  serviceTier?: string;
   imageModel: string;
   imageQuality: string;
   /** Image generation takes far longer than a chat turn, so it has its own deadline. */
@@ -65,6 +67,7 @@ export interface Config {
 
 const REASONING_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 const IMAGE_QUALITIES = ['low', 'medium', 'high', 'xhigh', 'max', 'auto'];
+const SERVICE_TIERS = ['default', 'fast'];
 
 export class ConfigError extends Error {
   constructor(message: string) {
@@ -93,9 +96,11 @@ function modelConfig(section: Provider, raw: Record<string, unknown>): ClaudeCon
 }
 
 function openAIConfig(raw: Record<string, unknown>): OpenAIConfig {
-  const { reasoningEffort, imageModel = 'gpt-image-2.5-flare', imageQuality = 'medium', imageTimeoutMs = 120000 } = raw;
+  const { reasoningEffort, serviceTier, imageModel = 'gpt-image-2.5-flare', imageQuality = 'medium', imageTimeoutMs = 120000 } = raw;
   requireValue(reasoningEffort === undefined || (typeof reasoningEffort === 'string' && REASONING_EFFORTS.includes(reasoningEffort)),
     `openai.reasoningEffort 必須是 ${REASONING_EFFORTS.join('、')} 之一，或省略。`);
+  requireValue(serviceTier === undefined || (typeof serviceTier === 'string' && SERVICE_TIERS.includes(serviceTier)),
+    `openai.serviceTier 必須是 ${SERVICE_TIERS.join('、')} 之一，或省略。`);
   requireValue(typeof imageModel === 'string' && imageModel.trim().length > 0, 'openai.imageModel 必須是模型名稱。');
   requireValue(typeof imageQuality === 'string' && IMAGE_QUALITIES.includes(imageQuality),
     `openai.imageQuality 必須是 ${IMAGE_QUALITIES.join('、')} 之一。`);
@@ -103,6 +108,7 @@ function openAIConfig(raw: Record<string, unknown>): OpenAIConfig {
   return {
     ...modelConfig('openai', raw),
     ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+    ...(serviceTier === undefined ? {} : { serviceTier }),
     imageModel, imageQuality, imageTimeoutMs,
   };
 }

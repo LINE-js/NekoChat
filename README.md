@@ -42,6 +42,7 @@ npm ci --include=dev --ignore-scripts
 | `openai.apiKey` | OpenAI API key，僅供伺服器使用 |
 | `openai.model` | 對話模型，例如 `gpt-6-luna`（最快、最便宜） |
 | `openai.reasoningEffort` | 選填，`none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`；省略時用模型預設值。可用值依模型而定，`gpt-6-luna` 支援 `none` |
+| `openai.serviceTier` | 選填，`fast` 或 `default`；省略時依 OpenAI 專案設定。`fast` 為 [Fast mode](https://developers.openai.com/api/docs/guides/fast-mode)（官方稱最多快 2.5 倍、延遲較穩定），每 token 另收溢價，只用於生成請求（計數 API 不接受此欄位）；支援模型見官方定價頁 |
 | `openai.contextTokens`／`maxOutputTokens`／`timeoutMs` | 與 `claude` 同義；`maxOutputTokens` 包含推理 tokens |
 | `openai.imageModel` | 畫圖模型，預設 `gpt-image-2.5-flare` |
 | `openai.imageQuality` | `low`、`medium`、`high`、`xhigh`、`max` 或 `auto`，預設 `medium`；越高越慢 |
@@ -201,3 +202,5 @@ OpenAI 人格快取斷點：150 項測試通過，確認決策請求的人格與
 畫圖不再卡住聊天室：151 項測試通過，新增圖片仍在生成時同一聊天室的下一則訊息照常回答、取消聊天室會停止背景中的圖片，並更新圖片／檔案失敗時的上下文規則。本機 WebSocket 搭配模擬 OpenAI（生成延遲 150ms、畫圖 3 秒），先要求畫圖、0.5 秒後再問一句：修改前第二句的回答在 3421ms 送出（排在圖片之後），修改後在 655ms 送出，圖片仍於約 3.2 秒送達。未呼叫外部服務。
 
 故障供應商暫緩：151 項測試通過，擴充備用測試涵蓋故障後 60 秒內直接使用備用、60 秒後恢復主要供應商，以及 HTTP 400 不改變順序。本機模擬 OpenAI 無回應（逾時 2 秒）、Claude 150ms 回應連續四則：修改前每則都約 2150ms，修改後第一則 2166ms、之後每則約 152ms。未呼叫外部服務。
+
+OpenAI Fast mode 設定：151 項測試通過，涵蓋 `openai.serviceTier` 驗證，以及 `service_tier` 只出現在生成請求、不出現在計數請求。預設不啟用，未以真實 OpenAI API 驗證速度或計費。

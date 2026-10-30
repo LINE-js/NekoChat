@@ -129,7 +129,7 @@ test('provider picks the primary section, defaults keep old Claude configs, and 
   delete raw.claude;
   await save();
   await assert.rejects(loadConfig(filename), /provider/);
-  for (const [field, value] of [['reasoningEffort', 'fast'], ['imageQuality', 'ultra'], ['imageTimeoutMs', 0], ['apiKey', '']] as const) {
+  for (const [field, value] of [['reasoningEffort', 'fast'], ['serviceTier', 'priority'], ['imageQuality', 'ultra'], ['imageTimeoutMs', 0], ['apiKey', '']] as const) {
     raw.provider = 'openai';
     raw.openai = { ...section, model: 'gpt-6-luna', [field]: value };
     await save();

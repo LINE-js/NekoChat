@@ -945,7 +945,7 @@ test('file decisions acknowledge first, then write the body in a second request'
 });
 
 const openai = {
-  ...claude, apiKey: 'openai-secret-key', model: 'gpt-6-luna', reasoningEffort: 'none',
+  ...claude, apiKey: 'openai-secret-key', model: 'gpt-6-luna', reasoningEffort: 'none', serviceTier: 'fast',
   imageModel: 'gpt-image-2.5-flare', imageQuality: 'low', imageTimeoutMs: 1_000,
 };
 const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 7]);
@@ -1017,7 +1017,8 @@ test('OpenAI counts, decides, draws JPEGs and writes files through its own APIs'
     ['gpt-6-luna', { type: 'function', name: 'conversation_reply' }, false, { effort: 'none' }, 10, false]);
   assert.ok(Array.isArray(decide.body.tools) && isRecord(decide.body.tools[0]) && decide.body.tools[0].strict === false);
   // The count covers exactly the generated input, without generation-only fields.
-  const { max_output_tokens: _limit, store: _store, ...counted } = decide.body;
+  const { max_output_tokens: _limit, store: _store, service_tier: tier, ...counted } = decide.body;
+  assert.equal(tier, 'fast');
   assert.deepEqual(count.body, counted);
 
   assert.ok(turn.draw);

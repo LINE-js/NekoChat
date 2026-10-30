@@ -18,6 +18,8 @@ openai:
   model: "gpt-6-luna"
   # 省略時使用模型預設值；gpt-6-luna 支援 none，回覆最快。
   reasoningEffort: "none"
+  # 選填：fast 為 Fast mode，回覆更快但每 token 較貴；省略時依 OpenAI 專案設定。
+  # serviceTier: "fast"
   contextTokens: 100000
   maxOutputTokens: 4096
   timeoutMs: 60000

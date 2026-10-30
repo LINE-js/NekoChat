@@ -417,7 +417,8 @@ export class ChatEngine implements ChatEngineLike {
         tools: [{ type: 'function', name: tool.name, description: tool.description, parameters: tool.input_schema, strict: false }],
         tool_choice: { type: 'function', name: tool.name }, parallel_tool_calls: false,
         ...(backend.config.reasoningEffort ? { reasoning: { effort: backend.config.reasoningEffort } } : {}),
-        ...(generate ? { max_output_tokens: config.maxOutputTokens, store: false } : {}),
+        // The count endpoint takes no service tier; it only changes how generations are scheduled.
+        ...(generate ? { max_output_tokens: config.maxOutputTokens, store: false, ...(backend.config.serviceTier ? { service_tier: backend.config.serviceTier } : {}) } : {}),
       },
     };
   }
