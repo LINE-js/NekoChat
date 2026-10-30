@@ -1047,7 +1047,8 @@ test('OpenAI counts, decides, draws JPEGs and writes files through its own APIs'
   }
 });
 
-test('a failing primary falls back to the other provider, which also serves that turn\'s media', async () => {
+test('a failing primary falls back to the other provider, which also serves that turn\'s media', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 0 });
   let openaiStatus = 500;
   let imageStatus = 200;
   const { engine, calls, logs } = providers(({ url, body }) => {
@@ -1072,7 +1073,12 @@ test('a failing primary falls back to the other provider, which also serves that
   assert.deepEqual(await turn.draw(new AbortController().signal), { svg: '<svg/>' });
   assert.ok(!calls.some(call => call.url.endsWith('/images/generations')));
 
+  // OpenAI recovered, but an unavailable provider stays behind the backup for a minute.
   openaiStatus = 200;
+  const cooled = calls.length;
+  assert.equal(requireTurn(await engine.prepare('chat', 'soon')).text, 'claude');
+  assert.ok(calls.slice(cooled).every(call => new URL(call.url).host === 'api.anthropic.com'));
+  t.mock.timers.tick(60_000);
   const drawing = requireTurn(await engine.prepare('chat', 'draw again')).draw;
   assert.ok(drawing);
   imageStatus = 500;
@@ -1091,6 +1097,15 @@ test('a failing primary falls back to the other provider, which also serves that
   }, { claude });
   await assert.rejects(aborting.engine.prepare('chat', 'stop', controller.signal), hasCode('ABORTED'));
   assert.equal(aborting.calls.length, 1);
+
+  // A request the provider rejected as invalid says nothing about availability, so it stays first.
+  let rejected = true;
+  const invalid = providers(({ url }) => url.startsWith('https://api.openai.com/')
+    ? rejected ? new Response('{}', { status: 400 }) : url.endsWith('/input_tokens') ? { input_tokens: 20 } : functionCall('conversation_reply', { shouldReply: true, reply: 'openai' })
+    : url.endsWith('/count_tokens') ? { input_tokens: 20 } : followupResult(true, 'claude'), { claude });
+  assert.equal(requireTurn(await invalid.engine.prepare('chat', 'one')).text, 'claude');
+  rejected = false;
+  assert.equal(requireTurn(await invalid.engine.prepare('chat', 'two')).text, 'openai');
 });
 
 test('provider selects the primary and must name a configured section', async () => {

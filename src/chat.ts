@@ -62,7 +62,10 @@ interface ChatState {
   revision: number;
 }
 
-type Backend = { name: 'claude'; config: ClaudeConfig } | { name: 'openai'; config: OpenAIConfig };
+type Backend = ({ name: 'claude'; config: ClaudeConfig } | { name: 'openai'; config: OpenAIConfig }) & {
+  /** Until this time a provider that just failed for availability is tried after the others. */
+  coolingUntil: number;
+};
 
 interface Tool {
   name: string;
@@ -78,6 +81,8 @@ const COMPRESS_MIN_BYTES = 4096;
 // Byte-level tokenizers spend at least one UTF-8 byte per token; this covers the prompt template the JSON body omits.
 const TEMPLATE_TOKENS = 2048;
 const BREAKPOINT = { mode: 'explicit' } as const;
+// How long an unavailable provider stays behind the others before it is tried first again.
+const COOLDOWN_MS = 60_000;
 
 function compress(json: string, signal: AbortSignal): Promise<Buffer<ArrayBuffer>> {
   signal.throwIfAborted();
@@ -293,8 +298,8 @@ export class ChatEngine implements ChatEngineLike {
       config.maxOutputTokens < config.contextTokens &&
       Number.isInteger(config.timeoutMs) && config.timeoutMs > 0;
     const backends: Backend[] = [];
-    if (openai) backends.push({ name: 'openai', config: { ...openai } });
-    if (claude) backends.push({ name: 'claude', config: { ...claude } });
+    if (openai) backends.push({ name: 'openai', config: { ...openai }, coolingUntil: 0 });
+    if (claude) backends.push({ name: 'claude', config: { ...claude }, coolingUntil: 0 });
     if ((provider ?? backends[0]?.name) === 'claude') backends.reverse();
     if (
       backends.length === 0 || (provider !== undefined && backends[0].name !== provider) ||
@@ -445,8 +450,22 @@ export class ChatEngine implements ChatEngineLike {
     if (followup && history.length === 0) return null;
     const user: ChatMessage = { role: 'user', content: input };
     const instruction = owner ? OWNER_SYSTEM : `${followup ? FOLLOWUP_SYSTEM : DIRECT_SYSTEM}\n${DECISION_SYSTEM}`;
-    return this.#fallback(this.#backends, async (backend, chain) => {
-      const decided = await this.#decide(backend, instruction, history, user, followup, signal);
+    const now = Date.now();
+    const cooling = (backend: Backend) => backend.coolingUntil > now;
+    // Waiting for a provider that is down (often a full timeout) on every turn would slow the backup too.
+    const order = [...this.#backends.filter(backend => !cooling(backend)), ...this.#backends.filter(cooling)];
+    return this.#fallback(order, async (backend, chain) => {
+      let decided;
+      try {
+        decided = await this.#decide(backend, instruction, history, user, followup, signal);
+      } catch (error) {
+        if (error instanceof ChatError && (error.code === 'TIMEOUT' ||
+          ((error.code === 'COUNT_FAILED' || error.code === 'GENERATION_FAILED') &&
+            (error.status === undefined || error.status === 429 || error.status >= 500)))) {
+          backend.coolingUntil = Date.now() + COOLDOWN_MS;
+        }
+        throw error;
+      }
       if (!decided) return null;
       const { messages, decision } = decided;
       // Non-strict OpenAI calls may spell an omitted optional field as null.

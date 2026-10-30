@@ -57,7 +57,8 @@ npm ci --include=dev --ignore-scripts
 
 ## OpenAI 與 Claude
 
-- 對話與畫圖預設使用主要供應商；另一個供應商有設定時作為備用。主要供應商的計數、生成或檔案內容請求失敗（HTTP 錯誤、網路錯誤、逾時、回應格式錯誤或輸出截斷）時，同一則訊息改由備用供應商從頭處理，終端機記錄 `openai_fallback:代碼[:HTTP 狀態]` 或 `claude_fallback:…`，不含訊息或金鑰。取消不會切換。逾時後才切換時，回覆最慢要等兩份逾時。
+- 對話與畫圖預設使用主要供應商；另一個供應商有設定時作為備用。主要供應商的計數、生成或檔案內容請求失敗（HTTP 錯誤、網路錯誤、逾時、回應格式錯誤或輸出截斷）時，同一則訊息改由備用供應商從頭處理，終端機記錄 `openai_fallback:代碼[:HTTP 狀態]` 或 `claude_fallback:…`，不含訊息或金鑰。取消不會切換。逾時後才切換時，該則回覆最慢要等兩份逾時。
+- 供應商的決策請求因逾時、網路錯誤、HTTP 429 或 5xx 失敗時，接下來 60 秒的新訊息先交給另一個供應商，不必每則都重新等它失敗；60 秒後恢復原本順序。HTTP 400 等請求本身的錯誤不影響順序。
 - 圖片與檔案從做出該回合決策的供應商開始：主要供應商這回合已失敗時，不再為同一回合的圖片或檔案重試它。
 - OpenAI 對話使用 [Responses API](https://developers.openai.com/api/docs/guides/function-calling)，以強制的 function call 回傳同一份決策格式（`strict: false`，因為 `draw`／`file` 是選填欄位）；`store: false` 不在 OpenAI 保存回應。上下文裁切改用 OpenAI 的 [`POST /v1/responses/input_tokens`](https://developers.openai.com/api/docs/guides/token-counting) 計數，規則與 Claude 相同。[Prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching) 的預設隱含斷點只落在最新的成員訊息，而頂層 `instructions` 不能設斷點；因此人格與判斷提示改放在開頭的 developer 訊息，人格與決策提示各加一個明確斷點（與 Claude 相同），讓不同聊天室、新對話與第一則訊息也能重用人格前綴。前綴需達 1024 tokens 才會快取，寫入按 1.25 倍輸入費率、讀取按 0.1 倍計價。請求不使用 gzip。
 - OpenAI 畫圖直接呼叫 [Images API](https://developers.openai.com/api/docs/guides/image-generation) 的 `POST /v1/images/generations`，以決策中的圖片描述為提示，產生 1024×1024 JPEG（官方說明 JPEG 比 PNG 快）後原樣上傳，不經過 SVG；不需要第二次對話請求，也不受 SVG 只能畫向量圖的限制。Claude 仍以 SVG 畫圖。OpenAI 以 HTTP 400 拒絕圖片（包含內容審核）時記錄 `image_rejected` 並回覆「這張圖沒辦法畫，請換個主題或說法。」，**不會**改用 Claude 重畫，以免繞過審核；其他圖片錯誤才會切換到 Claude 的 SVG。
@@ -198,3 +199,5 @@ OpenAI 主要、Claude 備用：149 項測試通過，涵蓋 OpenAI 的 `input_t
 OpenAI 人格快取斷點：150 項測試通過，確認決策請求的人格與判斷提示都帶明確斷點、檔案內容等後續請求只在人格帶斷點，計數與生成的輸入一致，且不再送出頂層 `instructions`。請求格式依官方參考文件，未以真實 OpenAI API 驗證命中率或延遲。
 
 畫圖不再卡住聊天室：151 項測試通過，新增圖片仍在生成時同一聊天室的下一則訊息照常回答、取消聊天室會停止背景中的圖片，並更新圖片／檔案失敗時的上下文規則。本機 WebSocket 搭配模擬 OpenAI（生成延遲 150ms、畫圖 3 秒），先要求畫圖、0.5 秒後再問一句：修改前第二句的回答在 3421ms 送出（排在圖片之後），修改後在 655ms 送出，圖片仍於約 3.2 秒送達。未呼叫外部服務。
+
+故障供應商暫緩：151 項測試通過，擴充備用測試涵蓋故障後 60 秒內直接使用備用、60 秒後恢復主要供應商，以及 HTTP 400 不改變順序。本機模擬 OpenAI 無回應（逾時 2 秒）、Claude 150ms 回應連續四則：修改前每則都約 2150ms，修改後第一則 2166ms、之後每則約 152ms。未呼叫外部服務。
