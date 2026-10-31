@@ -530,7 +530,8 @@ test('compression uses the UTF8 byte gate and skips payloads that would not shri
     callback();
   });
   const { engine, calls } = harness();
-  const input = '中'.repeat(1_000);
+  // 600 CJK characters: the body stays under 4096 characters but exceeds 4096 UTF-8 bytes.
+  const input = '中'.repeat(600);
   await engine.prepare('chat', input);
   assert.equal(compressed, 2);
   for (const { options, body } of calls) {
